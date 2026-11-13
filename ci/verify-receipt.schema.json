@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "coldverify receipt",
+  "description": "The .cold/verify-receipt.json a strict coldverify run writes. $defs/result is .cold/verify-result.json. Fields are documented in docs/verify-receipt.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "claim", "commit", "tree", "fingerprint", "pull_request", "builders", "command", "verifier", "environment", "procedure",
+               "artifacts", "acceptance_criteria", "criteria_verifier", "risk", "suggestion", "checks", "repro", "run", "flows", "deployed",
+               "result", "reason"],
+  "if": {"properties": {"deployed": {"type": "null"}}},
+  "then": {"properties": {"checks": {"required": ["repro", "tests", "tamper", "criteria"]}}},
+  "else": {"properties": {"checks": {"required": ["flows"]}, "flows": {"$ref": "#/$defs/flows", "required": ["contact"]}}},
+  "properties": {
+    "schema_version": {"const": 10},
+    "claim": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
+    "tree": {"type": ["string", "null"]},
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tree", "recipe", "environment"],
+      "properties": {
+        "tree": {"type": ["string", "null"]},
+        "recipe": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "environment": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "pull_request": {"type": ["integer", "null"]},
+    "builders": {"type": "array", "items": {"type": "string", "pattern": "^[^A-Z]+$"}, "uniqueItems": true},
+    "command": {"type": "array", "items": {"type": "string"}},
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "commit"],
+      "properties": {
+        "version": {"type": "string"},
+        "commit": {"type": ["string", "null"]}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "os", "python", "isolation", "guest_id"],
+      "properties": {
+        "host": {"type": "string"},
+        "os": {"type": "string"},
+        "python": {"type": "string"},
+        "backend": {"$ref": "#/$defs/backend"},
+        "isolation": {"enum": ["local", "ssh", "container", "coldbox-vm", "coldbox-guest"]},
+        "guest_id": {"type": ["string", "null"]}
+      }
+    },
+    "procedure": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "command"],
+        "properties": {
+          "step": {"type": "string"},
+          "command": {"type": "string"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "text", "covered_by"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^C[1-9][0-9]{0,2}$"},
+          "text": {"type": "string", "minLength": 1},
+          "covered_by": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "criteria_verifier": {
+      "anyOf": [{
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model", "effort"],
+        "properties": {
+          "provider": {"type": "string"},
+          "model": {"type": "string"},
+          "effort": {"type": "string"}
+        }
+      }, {"type": "null"}]
+    },
+    "risk": {
+      "anyOf": [{
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tier", "config", "matched", "signoff"],
+        "properties": {
+          "tier": {"enum": ["normal", "high"]},
+          "config": {"anyOf": [{"const": ".fleet/risk.json"}, {"type": "null"}]},
+          "matched": {"type": "array", "items": {"type": "string"}},
+          "signoff": {
+            "anyOf": [{
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provider", "model", "effort", "approved", "reason"],
+              "properties": {
+                "provider": {"type": "string"},
+                "model": {"type": "string"},
+                "effort": {"type": "string"},
+                "approved": {"type": "boolean"},
+                "reason": {"type": "string", "minLength": 1}
+              }
+            }, {"type": "null"}]
+          }
+        }
+      }, {"type": "null"}]
+    },
+    "suggestion": {
+      "anyOf": [{
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["commit", "archived_at", "shared_paths", "proofs", "used"],
+        "properties": {
+          "commit": {"type": "string", "minLength": 1},
+          "archived_at": {"type": "string", "minLength": 1},
+          "shared_paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "proofs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["strategy", "name"],
+              "properties": {"strategy": {"enum": ["repro", "missing-on-base", "flow"]}, "name": {"type": "string", "minLength": 1}}
+            }
+          },
+          "used": {"type": "boolean"}
+        }
+      }, {"type": "null"}]
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim"],
+      "properties": {
+        "claim": {"$ref": "#/$defs/check"},
+        "repro": {"$ref": "#/$defs/check"},
+        "tests": {"$ref": "#/$defs/check"},
+        "tamper": {"$ref": "#/$defs/check"},
+        "criteria": {"$ref": "#/$defs/check"},
+        "risk": {"$ref": "#/$defs/check"},
+        "flows": {"$ref": "#/$defs/check"},
+        "receipt": {"$ref": "#/$defs/check"}
+      }
+    },
+    "repro": {"anyOf": [{"$ref": "#/$defs/repro"}, {"type": "null"}]},
+    "run": {"anyOf": [{"$ref": "#/$defs/result"}, {"type": "null"}]},
+    "flows": {"anyOf": [{"$ref": "#/$defs/flows"}, {"type": "null"}]},
+    "deployed": {"type": ["string", "null"]},
+    "result": {"$ref": "#/$defs/verdict"},
+    "reason": {"type": "string"}
+  },
+  "$defs": {
+    "verdict": {"enum": ["PASS", "FAIL", "INCOMPLETE"]},
+    "backend": {"type": "string", "pattern": "^(local|coldbox|coldbox-api|ssh:[A-Za-z0-9][A-Za-z0-9._@-]*|container:[A-Za-z0-9][A-Za-z0-9._/:@-]*)$"},
+    "check": {
+      "type": "array",
+      "prefixItems": [{"$ref": "#/$defs/verdict"}, {"type": "string"}],
+      "minItems": 2,
+      "items": false
+    },
+    "repro": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result"],
+      "properties": {
+        "result": {"$ref": "#/$defs/verdict"},
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "base_exit", "head_exit"],
+            "properties": {
+              "name": {"type": "string"},
+              "base_exit": {"type": "integer"},
+              "head_exit": {"type": "integer"},
+              "kind": {"enum": ["proof", "missing-on-base", "acceptance", "unchanged", "regression", "unproven"]},
+              "base_output": {"type": "string"},
+              "head_output": {"type": "string"},
+              "commands": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}
+            }
+          }
+        },
+        "base": {"type": ["string", "null"]},
+        "head": {"type": ["string", "null"]},
+        "host": {"type": "string"},
+        "platform": {"type": "string"},
+        "backend": {"$ref": "#/$defs/backend"},
+        "opt_out_reason": {"type": ["string", "null"]},
+        "error": {"type": "string"}
+      }
+    },
+    "flows": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "reason", "base", "head", "host", "flows"],
+      "properties": {
+        "result": {"$ref": "#/$defs/verdict"},
+        "reason": {"type": "string"},
+        "base": {"type": ["string", "null"]},
+        "head": {"type": ["string", "null"]},
+        "host": {"type": "string"},
+        "contact": {
+          "anyOf": [{
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["established_by", "probe", "flow_contact"],
+            "properties": {
+              "established_by": {"const": "probed by coldverify"},
+              "probe": {"type": "string"},
+              "flow_contact": {"enum": ["proven", "not proven"]}
+            }
+          }, {"type": "null"}]
+        },
+        "flows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "base_exit", "head_exit", "kind", "base_output", "head_output", "commands"],
+            "properties": {
+              "name": {"type": "string"},
+              "base_exit": {"type": ["integer", "null"]},
+              "head_exit": {"type": "integer"},
+              "kind": {"enum": ["proof", "acceptance", "regression", "unrunnable", "deployed"]},
+              "base_output": {"type": "string"},
+              "head_output": {"type": "string"},
+              "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 2}
+            }
+          }
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "result", "reason", "head", "command", "exit_code", "tests_ran", "tests_source", "steps"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "result": {"$ref": "#/$defs/verdict"},
+        "reason": {"type": "string"},
+        "head": {"type": ["string", "null"]},
+        "command": {"type": "array", "items": {"type": "string"}},
+        "exit_code": {"type": "integer"},
+        "tests_ran": {"type": "integer"},
+        "tests_source": {"enum": ["junit", "output", null]},
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["step", "command", "status", "duration_ms"],
+            "properties": {
+              "step": {"type": "string"},
+              "command": {"type": "string"},
+              "status": {"enum": ["pass", "fail", "skip"]},
+              "duration_ms": {"type": "integer"}
+            }
+          }
+        },
+        "reused_from": {"type": "string"},
+        "backend": {"$ref": "#/$defs/backend"}
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldverify"
+version = "0.1.0"
+description = "Run a repository's verify recipe and report PASS only with fresh proof"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = ["Operating System :: POSIX"]
+
+[project.scripts]
+coldverify = "coldverify.ci.console:main"
+
+[tool.setuptools]
+packages = ["coldverify", "coldverify.ci"]
+package-dir = {"coldverify" = "."}
+cmdclass = {build_py = "coldverify.ci.build_stamp.StampBuild", sdist = "coldverify.ci.build_stamp.StampSdist"}
+
+[tool.setuptools.package-data]
+coldverify = ["coldverify", "pyproject.toml", "COMMIT", "skills/**/*"]
+"coldverify.ci" = ["**/*"]
+
+[tool.setuptools.exclude-package-data]
+"coldverify.ci" = ["**/__pycache__/*"]

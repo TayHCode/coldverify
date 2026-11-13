@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+checkout = Path.cwd()
+artifacts = Path(os.environ.get('COLD_FLOW_ARTIFACTS') or tempfile.mkdtemp())
+
+
+def git(repo, *args):
+    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Flow', '-c', 'user.email=flow@localhost', *args],
+                   check=True, capture_output=True)
+
+
+with tempfile.TemporaryDirectory() as folder:
+    repo = Path(folder) / 'repo'
+    git(folder, 'init', '-q', str(repo))
+    (repo / '.fleet').mkdir()
+    (repo / '.fleet/verify.sh').write_text('#!/bin/sh\nexit 0\n')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-q', '-m', 'base')
+    git(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+    flow = repo / '.fleet/flows/feature'
+    flow.parent.mkdir()
+    flow.write_text('#!/bin/sh\ntest -f feature.txt\n')
+    flow.chmod(0o755)
+    (repo / 'feature.txt').write_text('on\n')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-q', '-m', 'head')
+    run = subprocess.run([sys.executable, str(checkout / 'coldverify'), '--ci', '--claim', 'feature.txt exists'], cwd=repo,
+                         env={**os.environ, 'COLD_VERIFY_BACKEND': 'local'}, text=True, capture_output=True)
+    (artifacts / 'coldverify-output.txt').write_text(run.stdout + run.stderr)
+    receipt_path = repo / '.cold/verify-receipt.json'
+    if not receipt_path.is_file():
+        print(f'coldverify wrote no receipt (exit {run.returncode})')
+        sys.exit(2)
+    receipt = json.loads(receipt_path.read_text())
+    (artifacts / 'receipt.json').write_text(json.dumps(receipt, indent=2))
+
+flows = receipt.get('flows') or {}
+found = [(flow['name'], flow['base_exit'], flow['head_exit'], flow['kind']) for flow in flows.get('flows', [])]
+print('declared flows in the receipt:', found or 'none')
+sys.exit(0 if found == [('feature', 1, 0, 'proof')] else 1)

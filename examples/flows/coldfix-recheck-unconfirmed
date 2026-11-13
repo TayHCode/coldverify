@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""ColdFix flow: an interrupted lesson delivery must keep the weekly recheck job from reporting a clean run.
+
+Copy into a ColdFix checkout's .fleet/flows/. It runs ColdFix's own CLI against a throwaway store, with no
+network and no credentials: capture a failure twice, author a lesson, record its delivery as pending with no rule
+installed (what an interrupted install leaves), then run `coldfix.py --store STORE recheck`, the command
+systemd/coldfix-recheck.service runs. Pass: recheck exits 2 and lists the lesson as unchecked, "delivery
+unconfirmed". Fail: anything else, such as exit 0 with no lessons. Exit 125: the checkout is not ColdFix or
+the fixture could not be built.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+checkout = Path.cwd()
+
+
+def unprovisioned(reason):
+    print(f'cannot provision: {reason}')
+    sys.exit(125)
+
+
+if not (checkout / 'coldfix.py').is_file() or not (checkout / 'lesson_delivery.py').is_file():
+    unprovisioned('this checkout has no coldfix.py and lesson_delivery.py; run this flow from a ColdFix checkout')
+
+try:
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(os.path.abspath(folder))
+        artifacts = Path(os.environ.get('COLD_FLOW_ARTIFACTS') or folder)
+        store = folder / 'store'
+        target = folder / 'target'
+
+        def coldfix(*args, stdin=None):
+            return subprocess.run([sys.executable, '-B', str(checkout / 'coldfix.py'), '--store', str(store), *args],
+                                  cwd=folder, input=stdin, text=True, capture_output=True)
+
+        def setup(*args, stdin=None):
+            run = coldfix(*args, stdin=stdin)
+            if run.returncode:
+                unprovisioned(f'coldfix {args[0]} exited {run.returncode}: {(run.stderr or run.stdout).strip()[-300:]}')
+            return json.loads(run.stdout)
+
+        subprocess.run(['git', 'init', '-q', str(target)], check=True, capture_output=True)
+        for _ in range(2):
+            setup('capture', '--command', 'python3 -m unittest', '--repo', 'example', '--agent', 'codex',
+                  stdin='AssertionError: expected 2')
+        group = setup('propose')['groups'][0]['group_id']
+        check = folder / 'check.py'
+        check.write_text("import sys\nprint('{\"status\": \"PASS\"}')\nsys.exit(0)\n")
+        lesson = setup('lesson', '--group', group, '--kind', 'test', '--level', 'test', '--title', 'Verify the count',
+                       '--rule', 'Require the expected count.', '--failure', 'The count was wrong.',
+                       '--fix', 'Write the expected count.', '--check-file', str(check),
+                       '--check-command', 'python3 {check}', '--expected-failure', 'count-mismatch')
+        lesson_id = lesson['lesson_id']
+        rule = hashlib.sha256(b'Require the expected count.\n').hexdigest()
+        records = {hashlib.sha256((str(target) + lesson_id).encode()).hexdigest(): dict(
+            revision=lesson['id'], lesson_id=lesson_id, target=str(target), agentlocker=str(folder / 'agentlocker.py'),
+            export=str(store / 'exports' / f'lesson-{lesson_id}.md'), state='pending', export_hashes=[rule],
+            delivered_sha256=rule)}
+        (store / 'deliveries.json').write_text(json.dumps(records))
+        (artifacts / 'deliveries.json').write_text(json.dumps(records, indent=2))
+
+        recheck = coldfix('recheck')
+        (artifacts / 'recheck-output.txt').write_text(f'exit {recheck.returncode}\n{recheck.stdout}{recheck.stderr}')
+except Exception as error:
+    unprovisioned(f'{type(error).__name__}: {error}'[:300])
+
+print(f'recheck exited {recheck.returncode}: {recheck.stdout.strip()} {recheck.stderr.strip()[-500:]}')
+try:
+    rows = json.loads(recheck.stdout)['lessons']
+except (ValueError, KeyError, TypeError):
+    rows = []
+if not isinstance(rows, list):
+    rows = []
+expected = dict(lesson=lesson_id, target=str(target), result='unchecked', reason='delivery unconfirmed')
+sys.exit(0 if recheck.returncode == 2 and expected in rows else 1)

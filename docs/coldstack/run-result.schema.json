@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cold Stack run result",
+  "description": "One record per verification run. Only outcome pass means the run passed, and pass requires at least one step with every step passing. The evidence fields environment, claim, procedure, artifacts and retention are optional; a record without them is still valid v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "repo", "model", "steps", "outcome", "time", "cost"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "commit"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "snapshot_tree": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "effort"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "minLength": 1}
+      }
+    },
+    "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}},
+    "outcome": {"enum": ["pass", "fail", "incomplete"]},
+    "failure": {"$ref": "#/$defs/failure"},
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["waiting_ms", "setup_ms", "running_ms"],
+      "properties": {
+        "waiting_ms": {"$ref": "#/$defs/count_or_null"},
+        "setup_ms": {"$ref": "#/$defs/count_or_null"},
+        "running_ms": {"$ref": "#/$defs/count_or_null"}
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usd", "input_tokens", "output_tokens"],
+      "properties": {
+        "usd": {"type": ["number", "null"], "minimum": 0},
+        "input_tokens": {"$ref": "#/$defs/count_or_null"},
+        "output_tokens": {"$ref": "#/$defs/count_or_null"}
+      }
+    },
+    "environment": {"$ref": "#/$defs/environment"},
+    "claim": {"$ref": "#/$defs/claim"},
+    "procedure": {"$ref": "#/$defs/procedure"},
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+    "retention": {"$ref": "#/$defs/retention"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "pass"}}, "required": ["outcome"]},
+      "then": {
+        "not": {"required": ["failure"]},
+        "properties": {
+          "steps": {
+            "minItems": 1,
+            "items": {"properties": {"status": {"const": "pass"}}}
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "fail"}}, "required": ["outcome"]},
+      "then": {
+        "required": ["failure"],
+        "properties": {
+          "failure": {"properties": {"class": {"const": "product"}}},
+          "steps": {"contains": {"properties": {"status": {"const": "fail"}}, "required": ["status"]}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "incomplete"}}, "required": ["outcome"]},
+      "then": {
+        "required": ["failure"],
+        "properties": {"failure": {"properties": {"class": {"const": "harness"}}}}
+      }
+    },
+    {
+      "if": {"properties": {"steps": {"maxItems": 0}}, "required": ["steps"]},
+      "then": {"properties": {"outcome": {"const": "incomplete"}}}
+    },
+    {
+      "if": {
+        "properties": {"steps": {"contains": {"properties": {"status": {"const": "skip"}}, "required": ["status"]}}},
+        "required": ["steps"]
+      },
+      "then": {
+        "required": ["failure"],
+        "properties": {
+          "outcome": {"const": "incomplete"},
+          "failure": {"properties": {"cause": {"const": "skipped_step"}}, "required": ["cause"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"failure": {"properties": {"cause": {"const": "skipped_step"}}, "required": ["cause"]}},
+        "required": ["failure"]
+      },
+      "then": {
+        "properties": {"steps": {"contains": {"properties": {"status": {"const": "skip"}}, "required": ["status"]}}}
+      }
+    }
+  ],
+  "$defs": {
+    "count_or_null": {"type": ["integer", "null"], "minimum": 0},
+    "text": {"type": "string", "minLength": 1},
+    "utc_time": {"type": "string", "format": "date-time", "maxLength": 20, "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"},
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "os", "isolation"],
+      "properties": {
+        "host": {"$ref": "#/$defs/text"},
+        "os": {"$ref": "#/$defs/text"},
+        "isolation": {"enum": ["local", "ssh", "container", "vm", "coldbox-guest"]},
+        "guest_id": {"$ref": "#/$defs/text"},
+        "tools": {"type": "object", "additionalProperties": {"$ref": "#/$defs/text"}}
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement"],
+      "properties": {
+        "statement": {"$ref": "#/$defs/text"},
+        "source": {"$ref": "#/$defs/text"}
+      }
+    },
+    "procedure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands"],
+      "properties": {
+        "recipe": {"$ref": "#/$defs/text"},
+        "commands": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/text"},
+        "sha256": {"type": "string", "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "description": {"$ref": "#/$defs/text"}
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "policy"],
+      "properties": {
+        "owner": {"$ref": "#/$defs/text"},
+        "policy": {"enum": ["temporary", "keep"]},
+        "expires": {"$ref": "#/$defs/utc_time"},
+        "preserved_at": {"$ref": "#/$defs/text"}
+      },
+      "if": {"properties": {"policy": {"const": "temporary"}}, "required": ["policy"]},
+      "then": {"required": ["expires"]},
+      "else": {"not": {"required": ["expires"]}}
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step", "command", "status", "duration_ms"],
+      "properties": {
+        "step": {"type": "string", "minLength": 1},
+        "command": {"type": "string", "minLength": 1},
+        "status": {"enum": ["pass", "fail", "skip"]},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "failing_excerpt": {"type": "string"},
+        "inputs_hash": {"type": ["string", "null"]}
+      },
+      "if": {"properties": {"status": {"const": "fail"}}, "required": ["status"]},
+      "else": {"not": {"required": ["failing_excerpt"]}}
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "cause"],
+      "properties": {
+        "class": {"enum": ["product", "harness"]},
+        "cause": {"enum": [
+          "test_failure", "build_failure", "static_check", "behavior_mismatch",
+          "setup_failure", "dependency_install", "runner_unavailable", "timeout",
+          "resource_exhausted", "network", "tool_missing", "recipe_missing",
+          "skipped_step", "empty_run", "unknown"
+        ]},
+        "detail": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"class": {"const": "product"}}, "required": ["class"]},
+          "then": {"properties": {"cause": {"enum": ["test_failure", "build_failure", "static_check", "behavior_mismatch"]}}}
+        },
+        {
+          "if": {"properties": {"class": {"const": "harness"}}, "required": ["class"]},
+          "then": {"properties": {"cause": {"enum": [
+            "setup_failure", "dependency_install", "runner_unavailable", "timeout",
+            "resource_exhausted", "network", "tool_missing", "recipe_missing",
+            "skipped_step", "empty_run", "unknown"
+          ]}}}
+        }
+      ]
+    }
+  }
+}

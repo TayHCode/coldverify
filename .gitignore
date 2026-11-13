@@ -1,0 +1,7 @@
+.worktrees/
+__pycache__/
+.parity/
+build/
+*.egg-info/
+dist/
+.venv/

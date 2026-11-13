@@ -1,0 +1,23 @@
+{
+  "linux_hosts": [
+    "runner-a",
+    "ops-a",
+    "builder-b",
+    "builder-a"
+  ],
+  "repositories": {
+    "example-org/native-tool": "Native Linux checks on runner-a.",
+    "example-org/native-cli": "Native Linux checks on runner-a."
+  },
+  "macos_hosts": [
+    "mac-a"
+  ],
+  "macos_repositories": {
+    "example-org/mac-app": "Native macOS checks on mac-a."
+  },
+  "auxiliary_linux_repositories": {
+    "example-org/portability-checks": "Linux portability checks on runner-a."
+  },
+  "coldbox_host": "builder-a",
+  "owner": "example-org"
+}

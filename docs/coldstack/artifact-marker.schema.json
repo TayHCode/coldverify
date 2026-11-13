@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cold Stack artifact marker",
+  "description": "Says who owns an artifact on disk, where it came from, how long it must stay and where it is preserved. retention is the run-result v1 retention block: expires is retain_until and preserved_at is preservation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "retention", "provenance"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "retention": {"$ref": "run-result.schema.json#/$defs/retention"},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["producer", "created_at"],
+      "properties": {
+        "producer": {"$ref": "run-result.schema.json#/$defs/text"},
+        "created_at": {"$ref": "run-result.schema.json#/$defs/utc_time"},
+        "run_id": {"$ref": "run-result.schema.json#/$defs/text"},
+        "repo": {"$ref": "run-result.schema.json#/properties/repo"}
+      }
+    }
+  }
+}

@@ -1,0 +1,352 @@
+{
+  "exclude": [
+    "AGENTS.md",
+    "INVENTORY.md",
+    ".github/workflows/",
+    "ci/verification-platforms.json",
+    "ci/VERIFICATION-PLATFORMS.md",
+    "docs/evidence/",
+    "ops/",
+    "tests/test_fleet_policy.py",
+    "tests/test_ops_guest_deploy.py",
+    "tests/test_workflow_runners.py",
+    "docs/design/coldverify/luna-filter.md",
+    "docs/design/coldverify/PROOF-STEP.md",
+    "docs/design/coldverify/skip-filter-safety.md",
+    "docs/design/coldverify/luna-filter-eval/results.json",
+    "docs/design/coldverify/luna-filter-eval/run.log"
+  ],
+  "quickstart": [
+    {
+      "file": "README.md",
+      "line": 13,
+      "argv": [
+        "python3",
+        "coldverify",
+        "--version"
+      ]
+    },
+    {
+      "file": "README.md",
+      "line": 29,
+      "argv": [
+        "python3",
+        "-m",
+        "pip",
+        "install",
+        "."
+      ]
+    },
+    {
+      "file": "README.md",
+      "line": 66,
+      "argv": [
+        "python3",
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        "requirements.txt"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "role": "tests",
+      "argv": [
+        "python3",
+        "scripts/run_tests.py"
+      ],
+      "timeout": 3600
+    }
+  ],
+  "approvals": [
+    {
+      "scope": "verification",
+      "kind": "dependency-license-review",
+      "path": "@dependency/attrs",
+      "fingerprint": "ee22eb63d7836e08",
+      "reason": "attrs 26.1.0 declares License-Expression MIT and ships its MIT LICENSE file; it comes in through jsonschema, which only the tests use."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_criteria.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "4b398cd0f2866fb78d72399919c702bb5f5d523eb1fc3206fe8f924b9fbb4251",
+      "line": 194,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_criteria.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "4b398cd0f2866fb78d72399919c702bb5f5d523eb1fc3206fe8f924b9fbb4251",
+      "line": 194,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_receipt.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "3b3694d0f26aaf7ed8e2179290c1b029de6fba30ccbd15bb1a4c35d18ae915d6",
+      "line": 852,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_receipt.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "3b3694d0f26aaf7ed8e2179290c1b029de6fba30ccbd15bb1a4c35d18ae915d6",
+      "line": 852,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "tests/criteria_shim.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "18bd8e4850f95337c8d466b61fd2395f34d9748296c7564ab107298fcfce8a13",
+      "line": 32,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "tests/criteria_shim.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "18bd8e4850f95337c8d466b61fd2395f34d9748296c7564ab107298fcfce8a13",
+      "line": 32,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "tests/test_criteria_check.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "1ab40323bf21a3f17828a9d8b167e39ea2f5fe0e2e839300ecf441c04cf92a7f",
+      "line": 279,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "tests/test_criteria_check.py",
+      "fingerprint": "71546855d6279ef7",
+      "classification": "false-positive",
+      "source_sha256": "1ab40323bf21a3f17828a9d8b167e39ea2f5fe0e2e839300ecf441c04cf92a7f",
+      "line": 279,
+      "reason": "Test-name separator string, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_evidence_export.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "6bf8109727fc60850699c2174a327a385c764f6aef64408800428ef5d29741cb",
+      "line": 56,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_evidence_export.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "6bf8109727fc60850699c2174a327a385c764f6aef64408800428ef5d29741cb",
+      "line": 56,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_linux_defaults.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "95004812a2fedbb3366c372a5924aea00bf5604985254d5c430f45dfd9c8b819",
+      "line": 79,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_linux_defaults.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "95004812a2fedbb3366c372a5924aea00bf5604985254d5c430f45dfd9c8b819",
+      "line": 79,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_linux_defaults.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "95004812a2fedbb3366c372a5924aea00bf5604985254d5c430f45dfd9c8b819",
+      "line": 80,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_linux_defaults.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "95004812a2fedbb3366c372a5924aea00bf5604985254d5c430f45dfd9c8b819",
+      "line": 80,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_linux_defaults.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "95004812a2fedbb3366c372a5924aea00bf5604985254d5c430f45dfd9c8b819",
+      "line": 81,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_linux_defaults.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "95004812a2fedbb3366c372a5924aea00bf5604985254d5c430f45dfd9c8b819",
+      "line": 81,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_linux_verify.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "6a1d1ce25f29885874da67b6980e46c896b092d6d4395c5f3af954cb38a9c765",
+      "line": 37,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_linux_verify.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "classification": "false-positive",
+      "source_sha256": "6a1d1ce25f29885874da67b6980e46c896b092d6d4395c5f3af954cb38a9c765",
+      "line": 37,
+      "reason": "GitHub SSH remote user in a URL, not a person."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv4",
+      "path": "tests/test_verify_fastlane.py",
+      "fingerprint": "37fcff24bf62035b",
+      "classification": "false-positive",
+      "source_sha256": "e4e893b22e5b94b4f5871cbfccae45027f7f7dc3442151c969bcf5234bd400a0",
+      "line": 344,
+      "reason": "RFC 5737 documentation address in a test fixture."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv4",
+      "path": "tests/test_verify_fastlane.py",
+      "fingerprint": "37fcff24bf62035b",
+      "classification": "false-positive",
+      "source_sha256": "e4e893b22e5b94b4f5871cbfccae45027f7f7dc3442151c969bcf5234bd400a0",
+      "line": 344,
+      "reason": "RFC 5737 documentation address in a test fixture."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_2.py",
+      "fingerprint": "be88de129f1a497c",
+      "classification": "false-positive",
+      "source_sha256": "f7220ed531f31df377e3ecf9fbcad3206e2084125df55db55089a3f05f2d92da",
+      "line": 18,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_2.py",
+      "fingerprint": "be88de129f1a497c",
+      "classification": "false-positive",
+      "source_sha256": "f7220ed531f31df377e3ecf9fbcad3206e2084125df55db55089a3f05f2d92da",
+      "line": 18,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_2.py",
+      "fingerprint": "be88de129f1a497c",
+      "classification": "false-positive",
+      "source_sha256": "f7220ed531f31df377e3ecf9fbcad3206e2084125df55db55089a3f05f2d92da",
+      "line": 22,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_2.py",
+      "fingerprint": "be88de129f1a497c",
+      "classification": "false-positive",
+      "source_sha256": "f7220ed531f31df377e3ecf9fbcad3206e2084125df55db55089a3f05f2d92da",
+      "line": 22,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_3.py",
+      "fingerprint": "be88de129f1a497c",
+      "classification": "false-positive",
+      "source_sha256": "6321ae031d13c4903cfaa1dbd2129c6f16396532bbadd116bccdd36cf48a68e9",
+      "line": 14,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_3.py",
+      "fingerprint": "be88de129f1a497c",
+      "classification": "false-positive",
+      "source_sha256": "6321ae031d13c4903cfaa1dbd2129c6f16396532bbadd116bccdd36cf48a68e9",
+      "line": 14,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_3.py",
+      "fingerprint": "ff5838ced1b33498",
+      "classification": "false-positive",
+      "source_sha256": "6321ae031d13c4903cfaa1dbd2129c6f16396532bbadd116bccdd36cf48a68e9",
+      "line": 18,
+      "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_verify_repro_pytest_functions_3.py",
+      "fingerprint": "ff5838ced1b33498",
+      "classification": "false-positive",
+      "source_sha256": "6321ae031d13c4903cfaa1dbd2129c6f16396532bbadd116bccdd36cf48a68e9",
+      "line": 18,
+      "reason": "Python decorator text, not an address."
+    }
+  ]
+}

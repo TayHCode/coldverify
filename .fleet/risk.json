@@ -1,0 +1,1 @@
+{"high": [".github/**", ".fleet/**", "ci/verify_receipt.py", "ci/verify_criteria.py", "ci/verify_repro.py", "ci/verify_trace.py"]}
