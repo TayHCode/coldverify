@@ -34,6 +34,21 @@ class RunTests(unittest.TestCase):
         self.assertIn('Skipped 1: rt186 widget missing \\xe9\n', out.getvalue())
         self.assertIn('Ran 2 tests', out.getvalue())
 
+    def test_the_shared_job_cap_limits_the_runner_when_no_jobs_flag_is_given(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as scratch:
+            tests = Path(scratch)
+            (tests / 'test_cap.py').write_text(
+                'import unittest\n\n\nclass Ok(unittest.TestCase):\n    def test_ok(self):\n        pass\n')
+            out = io.StringIO()
+            with mock.patch.object(runner, 'TESTS', tests), mock.patch('sys.argv', ['run_tests.py']), \
+                    mock.patch.dict('os.environ', COLD_VERIFY_JOBS='1'), \
+                    mock.patch.object(sys, 'path', list(sys.path)), mock.patch.dict(sys.modules), \
+                    contextlib.redirect_stdout(out):
+                code = runner.main()
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn('(1 jobs)', out.getvalue())
+
     def test_running_twice_in_one_process_gives_the_same_result(self):
         self.test_a_module_that_skips_at_import_prints_its_reason()
         self.test_a_module_that_skips_at_import_prints_its_reason()

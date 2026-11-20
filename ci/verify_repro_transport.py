@@ -76,7 +76,7 @@ def remote(folder):
     os.environ['GITHUB_WORKSPACE'] = str(checkout)
     os.environ['GITHUB_HEAD_REF'] = request['branch']
     os.environ['GITHUB_EVENT_NAME'] = request['event']
-    code = verify_repro.gate(checkout, request['force'], request['reason'], request['details'], request['exercised'])
+    code = verify_repro.gate(checkout, request['force'], request['reason'], request['details'], request['exercised'], local=False)
     evidence = checkout / '.cold/verify-repro.json'
     if not evidence.is_file():
         raise RuntimeError('native repro returned no evidence')

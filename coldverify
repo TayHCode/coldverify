@@ -17,7 +17,7 @@ HOST = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?')
 COMMIT = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 EXPLICIT = ('base', 'head', 'test_command')
 EXPLICIT_CONFLICTS = ('compat', 'deployed', 'cache', 'publish_check', 'no_repro_reason', 'require_receipt', 'history',
-                      'criteria_check', 'preview')
+                      'criteria_check', 'criteria_verifier', 'preview')
 GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES')
 
@@ -57,6 +57,8 @@ def commit_sha(text):
 def explicit_error(args):
     given = [name for name in EXPLICIT if getattr(args, name) is not None]
     if not given:
+        if args.suite_command is not None:
+            return '--suite-command needs --base, --head and --test-command'
         return '--install-command needs --base, --head and --test-command' if args.install_command is not None else None
     if len(given) < len(EXPLICIT):
         return '--base, --head and --test-command go together'
@@ -64,6 +66,8 @@ def explicit_error(args):
         return '--test-command cannot be empty'
     if args.install_command is not None and not args.install_command.strip():
         return '--install-command cannot be empty'
+    if args.suite_command is not None and not args.suite_command.strip():
+        return '--suite-command cannot be empty'
     conflicts = ['--' + name.replace('_', '-') for name in EXPLICIT_CONFLICTS if getattr(args, name)]
     if conflicts:
         return '--test-command cannot be combined with ' + ', '.join(conflicts)
@@ -76,6 +80,8 @@ def parser():
     verify.add_argument('--claim', help='What the change claims to do; defaults to the "## Claim" section of the PR description')
     verify.add_argument('--builder-model', action='append', default=[],
                         help='A model that built the change; repeat for each. The acceptance-criteria verifier excludes them. A PR\'s "Builder-Model: MODEL" lines must name the same models')
+    verify.add_argument('--criteria-verifier', nargs=4, metavar=('PROVIDER', 'MODEL', 'EFFORT', 'EXECUTABLE'),
+                        help='Use a trusted standalone criteria adapter executable outside the checkout')
     verify.add_argument('--no-repro-reason', help='Record why no repro test is possible; the run is then INCOMPLETE, never PASS')
     verify.add_argument('--ci', action='store_true', help='Run ordinary CI without the interactive verification-skill prerequisite; in a GitHub Actions job a strict --ci run '
                         'without --publish-check is the merge gate: it exits 1 only for failing tests or flows, a secret or lesson-check '
@@ -91,11 +97,13 @@ def parser():
     verify.add_argument('--publish-check', action='store_true',
                         help='In a GitHub Actions job, publish the receipt as a "coldverify receipt" check run bound to the tree')
     verify.add_argument('--require-receipt', action='store_true',
-                        help='Exit 0 only when GitHub Actions published a PASS receipt for the tree of HEAD, on the PR head or '
-                             'attached to the PR with a "Coldverify-Receipt: <check run URL>" line')
+                        help='Require a published PASS receipt for the current suite checkout, repro base and head, and claim; '
+                             'use --claim before opening a PR')
     verify.add_argument('--criteria-check', type=int, metavar='PR',
                         help='On a trusted host, never in CI: derive and link the acceptance criteria for this PR\'s head from its '
                              'strict receipt and print them; with --publish-check, post them as a "coldverify criteria" check run')
+    verify.add_argument('--trusted-suite', type=Path, metavar='FILE',
+                        help='On a Coldbox host, check the committed HEAD with a host-selected suite and verify the host receipt')
     verify.add_argument('--deployed', type=deployed_target, metavar='URL_OR_HOST',
                         help='Run only the flows that read COLD_DEPLOYED_TARGET, once, against this live target, and write the receipt; '
                              'no repro or tests. The flows must only read from the target')
@@ -111,6 +119,8 @@ def parser():
     verify.add_argument('--install-command', metavar='COMMAND',
                         help='With --test-command: untrusted shell command run before it in each of the base and head '
                              'worktrees, so each side builds its own dependencies; it gets network, the test does not')
+    verify.add_argument('--suite-command', metavar='COMMAND',
+                        help='With --test-command: run the suite in a fresh sandboxed checkout of --head')
     verify.add_argument('--preview', '--explain-skips', action='store_true', dest='preview',
                         help='Print which tests would run or be skipped, and which filter decided, without running anything')
     return verify
@@ -142,7 +152,11 @@ def main(argv=None):
         print(f'coldverify needs Python {floor} or newer; {sys.executable} is Python {dotted(sys.version_info[:3])}',
               file=sys.stderr, flush=True)
         return 2
-    args = parser().parse_args(argv)
+    cli = parser()
+    args = cli.parse_args(argv)
+    if args.trusted_suite is not None and any(value != cli.get_default(name) for name, value in vars(args).items()
+                                              if name != 'trusted_suite'):
+        cli.error('--trusted-suite runs on its own')
     problem = explicit_error(args)
     if problem:
         print(problem, file=sys.stderr, flush=True)
@@ -159,6 +173,17 @@ def main(argv=None):
     top = subprocess.run(['git', 'rev-parse', '--show-toplevel'], text=True, capture_output=True, env=env)
     target = Path(top.stdout.strip()) if top.returncode == 0 else Path.cwd()
     sys.path.insert(0, str(ROOT / 'ci'))
+    if args.trusted_suite is not None and top.returncode == 0:
+        from verify_backend import Unavailable, trusted_suite
+        from verify_context import coldbox_guest
+        try:
+            if os.environ.get('GITHUB_ACTIONS') == 'true' or coldbox_guest():
+                raise Unavailable('the trusted suite requires a Coldbox host')
+            result, reason = trusted_suite(target, args.trusted_suite, env)
+        except Unavailable as error:
+            result, reason = 'INCOMPLETE', str(error)
+        print(f'TESTS {result}: {reason}', flush=True)
+        return {'PASS': 0, 'FAIL': 1, 'INCOMPLETE': 2}[result]
     if args.preview:
         import verify_filter
         return verify_filter.preview(target)
@@ -173,11 +198,14 @@ def main(argv=None):
         import verify_history
         return verify_history.show(target)
     if args.criteria_check:
+        if args.builder_model:
+            print('COLDVERIFY CRITERIA INCOMPLETE: --criteria-check resolves its builder from T3', flush=True)
+            return 2
         import verify_receipt
-        return verify_receipt.criteria_check(target, args.criteria_check, list(dict.fromkeys(args.builder_model)), args.publish_check)
+        return verify_receipt.criteria_check(target, args.criteria_check, args.publish_check)
     if args.require_receipt:
         import verify_receipt
-        result, reason = verify_receipt.require(target)
+        result, reason = verify_receipt.require(target, args.claim)
         print(f'COLDVERIFY RECEIPT {result}: {reason}', flush=True)
         return verify_receipt.CODES.get(result, 1)
     from verify_context import coldbox_guest
@@ -209,7 +237,7 @@ def main(argv=None):
         except verify_receipt.PullRequestUnknown as error:
             pull_error = str(error)
     claim = (args.claim or (verify_receipt.claim_from(pull[1]) if pull else '')).strip()
-    builders = list(dict.fromkeys(args.builder_model))
+    builders = list(dict.fromkeys(model.strip() for model in args.builder_model if model.strip()))
     declared = verify_receipt.builders_from(pull[1]) if pull else None
     (target / '.cold').mkdir(exist_ok=True)
     (target / '.cold/.gitignore').write_text('*\n')
@@ -232,38 +260,47 @@ def main(argv=None):
         if explicit:
             import verify_explicit
             checkout = subprocess.run(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True, capture_output=True, env=env).stdout.strip()
-            if checkout != args.head:
+            if checkout != args.head and args.suite_command is None:
                 print(f'HEAD is {checkout or "unknown"}, not --head {args.head}; check out --head first', file=sys.stderr, flush=True)
                 return 2
-            repro = verify_explicit.run(target, args.base, args.head, args.test_command, args.install_command)
+            repro = verify_explicit.run(target, args.base, args.head, args.test_command, args.install_command,
+                                        args.suite_command)
             return verify_receipt.finish(target, claim, None, repro, ['coldverify', *sys.argv[1:]], verifier(), None, builders,
-                                         claim_source='coldverify --claim')
+                                         claim_source='coldverify --claim', suite_revision=args.head if args.suite_command else None)
         withheld = {key: os.environ.pop(key) for key in PUBLISH_TOKENS if args.publish_check and key in os.environ}
         env = {key: value for key, value in env.items() if key not in withheld}
         import verify_flows
-        repro = hashes = None
+        repro = repro_evidence = hashes = None
         merge_gate = args.ci and not (args.publish_check or args.deployed) and os.environ.get('GITHUB_ACTIONS') == 'true'
         if args.deployed:
-            verify_flows.deployed(target, args.deployed)
+            flows = verify_flows.deployed(target, args.deployed)
         else:
             import verify_fastlane
             failed = merge_gate and verify_fastlane.scans(target)
             if failed:
                 return failed
+            docs = merge_gate and verify_fastlane.docs_only(target)
+            if docs:
+                print(f'COLDVERIFY CI PASS: docs only ({len(docs)} .md file(s), none named by another tracked file). '
+                      'THE TESTS DID NOT RUN on this pull request and nothing was verified; the push to main runs the full suite.',
+                      flush=True)
+                return 0
             import verify_history
             verify_history.announce(target)
             repro = verify_repro_transport.run(target, True, args.no_repro_reason, exercised=True)
-            hashes = verify_receipt.fingerprint(target, verify_receipt.read(target / verify_receipt.REPRO_PATH), verifier(), env)
+            repro_evidence = verify_receipt.read(target / verify_receipt.REPRO_PATH)
+            hashes = verify_receipt.fingerprint(target, repro_evidence, verifier(), env)
             os.environ.update(withheld)
             reused = args.cache and not args.no_cache and verify_receipt.reuse(target, hashes, pull)
             withheld = {key: os.environ.pop(key) for key in withheld}
             if not reused:
                 verify_trace.run(command, target, env=env, gate=args.gate, no_cache=args.no_cache or not args.cache, ci=args.ci)
-            verify_flows.run(target)
+            flows = verify_flows.run(target, repro_evidence or {})
         os.environ.update(withheld)
         source = 'coldverify --claim' if (args.claim or '').strip() else 'pull request'
         code = verify_receipt.finish(target, claim, pull, repro, ['coldverify', *sys.argv[1:]], verifier(), pull_error, builders,
-                                     args.publish_check, source, hashes, args.deployed, declared)
+                                     args.publish_check, source, hashes, args.deployed, declared, flows=flows, repro=repro_evidence,
+                                     criteria_adapter=args.criteria_verifier)
         if not merge_gate:
             return code
         return verify_receipt.ci_exit(verify_receipt.read(target / verify_receipt.RECEIPT_JSON),

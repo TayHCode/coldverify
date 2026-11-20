@@ -2,6 +2,7 @@
 """Run a repository's real suite on an approved native Linux host."""
 import argparse
 import io
+import json
 import os
 import platform
 import random
@@ -17,13 +18,21 @@ import uuid
 from pathlib import Path
 
 import evidence_export
+import npm_content_cache
 import verify_backend
+import verify_cache
 import verify_policy
 import windows_lane
-from verify_context import coldbox_guest, record_backend, record_snapshot
+from verify_context import SuitePhase, coldbox_guest, record_backend, record_run_context, record_snapshot
 
 SSH_CONNECTION_FAILED = 255
 CONNECT_ATTEMPTS = 8
+REMOTE_PRODUCT_FAILED = 65
+REMOTE_EXECUTION_ABORTED = 75
+
+
+class RecipeFailed(subprocess.CalledProcessError):
+    pass
 
 
 def git_environment():
@@ -68,12 +77,18 @@ def native_host():
 
 
 def command(args, directory, env):
-    process = subprocess.Popen(args, cwd=directory, env=env, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-    for line in process.stdout:
-        print(line, end='', flush=True)
-    if process.wait():
-        raise subprocess.CalledProcessError(process.returncode, args)
+    try:
+        with subprocess.Popen(args, cwd=directory, env=env, text=True, errors='replace', stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL) as process:
+            for line in process.stdout:
+                print(line, end='', flush=True)
+            code = process.wait()
+    except OSError as error:
+        raise verify_backend.ExecutionAborted(str(error)) from error
+    if code < 0:
+        raise verify_backend.ExecutionAborted(f'the verification command was terminated by signal {-code}')
+    if code:
+        raise RecipeFailed(code, args)
 
 
 def snapshot(source, destination):
@@ -124,7 +139,8 @@ def snapshot(source, destination):
 
     if source_recipe != recipe(destination):
         raise RuntimeError('a complete .fleet/verify.sh or .fleet/verify.py must be included in the verification snapshot')
-    record_snapshot(destination)
+    if os.environ.get('COLD_VERIFY_SNAPSHOT_RECEIPT'):
+        record_snapshot(destination, suite_head=verify_cache.head_sha(destination), suite_tree=verify_cache.tree_sha(destination))
 
 
 def fetch(remote, dest, folder, pattern, target, limit):
@@ -185,22 +201,29 @@ def dispatch(directory, backend, repo, generic=False):
         execution = f'''import platform, runpy, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, 'ci')
+import verify_backend
+runner = runpy.run_path('ci/linux-verify.py')
 try:
     if platform.system() != 'Linux' or 'microsoft' in platform.release().casefold():
         raise RuntimeError('native verification needs native Linux, not WSL or another OS')
-    runpy.run_path('ci/linux-verify.py')['verify'](Path('checkout').resolve(), generic={generic!r}, local=True)
-except subprocess.CalledProcessError:
+    runner['verify'](Path('checkout').resolve(), generic={generic!r}, local=True)
+except runner['RecipeFailed']:
     print('FAIL: real verification command failed', file=sys.stderr)
-    sys.exit(1)
+    sys.exit({REMOTE_PRODUCT_FAILED})
 except ValueError as error:
     print(str(error), file=sys.stderr)
-    sys.exit(1)
-except (OSError, RuntimeError) as error:
+    sys.exit({REMOTE_PRODUCT_FAILED})
+except verify_backend.ExecutionAborted as error:
+    print(f'INCOMPLETE: {{error}}', file=sys.stderr)
+    sys.exit({REMOTE_EXECUTION_ABORTED})
+except (OSError, RuntimeError, subprocess.SubprocessError) as error:
     print(f'INCOMPLETE: {{error}}', file=sys.stderr)
     sys.exit(2)
 '''
         command = (f'rm -rf {dest}; (mkdir -p {dest} && tar -xzf - -C {dest}) || exit 2; '
-                   f'cd {dest} && PATH="$HOME/.local/bin:$HOME/bin:$PATH" {assignments} python3 -c {shlex.quote(execution)}; '
+                   'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"; '
+                   f'cd {dest} && command -v python3 >/dev/null || exit 2; '
+                   f'{assignments} python3 -c {shlex.quote(execution)}; '
                    f'status=$?; exit $status')
         for attempt in range(CONNECT_ATTEMPTS):
             tar = subprocess.Popen(['tar', '-czf', '-', '-C', str(stage), '.'], stdout=subprocess.PIPE)
@@ -209,15 +232,26 @@ except (OSError, RuntimeError) as error:
             tar.wait()
             if status != SSH_CONNECTION_FAILED:
                 try:
-                    if status not in (0, 1, 2):
-                        raise RuntimeError(f'the {backend} backend exited {status} without a verdict')
-                    if subprocess.run([*remote, f'grep -q backend {dest}/started.json'], check=False).returncode == 0:
-                        record_backend(backend)
+                    if status not in (0, 2, REMOTE_PRODUCT_FAILED, REMOTE_EXECUTION_ABORTED):
+                        raise verify_backend.ExecutionAborted(f'the {backend} backend exited {status} without a verdict')
+                    observed = subprocess.run([*remote, f'head -c 4096 {dest}/started.json'], text=True,
+                                              capture_output=True, check=False)
+                    started = json.loads(observed.stdout) if observed.returncode == 0 else {}
+                    if not isinstance(started, dict):
+                        raise ValueError('the remote suite returned invalid snapshot evidence')
+                    record_run_context(snapshot_tree=started.get('snapshot_tree'), suite_head=started.get('suite_head'),
+                                       suite_tree=started.get('suite_tree'), backend=backend if started.get('backend') else None)
                     if status == 0 and 'COLD_VERIFY_CACHE_DIR' in context:
                         fetch(remote, dest, 'cache', r'[0-9a-f]{64}\.json', cache, 1_000_000)
-                    if status == 0 and 'COLD_VERIFY_JUNIT_DIR' in context:
+                    if status in (0, REMOTE_EXECUTION_ABORTED) and 'COLD_VERIFY_JUNIT_DIR' in context:
                         fetch(remote, dest, 'junit', r'[\w-][\w.-]*\.xml(?:\.sig)?', Path(os.environ['COLD_VERIFY_JUNIT_DIR']), 64_000_000)
-                    return status
+                    if status == REMOTE_EXECUTION_ABORTED:
+                        raise verify_backend.ExecutionAborted(f'the {backend} backend could not finish the suite')
+                    if status == 2:
+                        record_run_context(infrastructure_phase=SuitePhase.SETUP)
+                    return 1 if status == REMOTE_PRODUCT_FAILED else status
+                except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
+                    raise verify_backend.ExecutionAborted(f'could not collect evidence from the {backend} backend: {error}') from error
                 finally:
                     subprocess.run([*remote, f'rm -rf {dest}'], check=False)
             if attempt < CONNECT_ATTEMPTS - 1:
@@ -259,6 +293,12 @@ def verify(directory, generic=False, local=False):
         for name in ['GH_TOKEN', 'GITHUB_TOKEN', 'FLEET_GITHUB_APP', 'ANTHROPIC_API_KEY',
                      'OPENAI_API_KEY', 'XAI_API_KEY', 'GROK_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY']:
             env.pop(name, None)
+        caller_home = env.get('HOME') if (coldbox_guest() and env.get('GITHUB_ACTIONS') == 'true'
+                                          and env.get('GITHUB_JOB') and env.get('HOME') == '/home/runner') else None
+        if caller_home:
+            for name in list(env):
+                if name.casefold() == 'npm_config_cache':
+                    del env[name]
         for name, folder in [('HOME', 'home'), ('TMPDIR', 'tmp'), ('XDG_CONFIG_HOME', 'config'),
                              ('XDG_DATA_HOME', 'data'), ('XDG_STATE_HOME', 'state'), ('XDG_CACHE_HOME', 'cache')]:
             target = temporary / folder
@@ -266,15 +306,21 @@ def verify(directory, generic=False, local=False):
             env[name] = str(target)
         env.pop('PYTHONDONTWRITEBYTECODE', None)
         env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8', CI='true')
+        if caller_home:
+            env['npm_config_cache'] = str(temporary / 'home' / '.npm')
         selected = recipe(directory)
         if selected or generic:
             record_backend('local')
-        if selected:
-            command(selected, directory, env)
-        elif generic:
-            command([sys.executable, str(Path(__file__).resolve().parent / 'generic_verify.py')], directory, env)
-        else:
-            raise RuntimeError('a real verification recipe is required at .fleet/verify.sh or .fleet/verify.py')
+        with npm_content_cache.content_store(caller_home, create=True) as caller_cache, \
+                npm_content_cache.content_store(env['HOME'] if caller_home else None, create=True) as private_cache:
+            seeded = npm_content_cache.copy_content(caller_cache, private_cache)
+            if selected:
+                command(selected, directory, env)
+            elif generic:
+                command([sys.executable, str(Path(__file__).resolve().parent / 'generic_verify.py')], directory, env)
+            else:
+                raise RuntimeError('a real verification recipe is required at .fleet/verify.sh or .fleet/verify.py')
+            npm_content_cache.copy_content(private_cache, caller_cache, exclude=seeded)
     print(f'PASS: real Linux verification on {host}', flush=True)
 
 
@@ -322,13 +368,18 @@ def main():
             except verify_backend.NoApi as error:
                 print(f'{error}; running in a disposable Coldbox VM instead', file=sys.stderr, flush=True)
         return dispatch(directory, backend or 'coldbox', repo, generic)
-    except subprocess.CalledProcessError:
+    except RecipeFailed:
         print('FAIL: real verification command failed', file=sys.stderr)
         return 1
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 1
-    except (OSError, RuntimeError) as error:
+    except verify_backend.ExecutionAborted as error:
+        record_run_context(infrastructure_phase=SuitePhase.EXECUTION)
+        print(f'INCOMPLETE: {error}', file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        record_run_context(infrastructure_phase=SuitePhase.SETUP)
         print(f'INCOMPLETE: {error}', file=sys.stderr)
         return 2
 

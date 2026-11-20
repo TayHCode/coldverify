@@ -282,6 +282,44 @@ def scans(root):
     return scanned or checked or None
 
 
+NOT_DOCS_FOLDERS = frozenset({'tests', 'test', 'fixtures', 'testdata', '.github', '.fleet'})
+NOT_MARKDOWN = ':(exclude,glob)**/*.md'
+PLAIN_FILE_MODES = frozenset({'000000', '100644'})
+
+
+def named_outside_markdown(root, text):
+    found = subprocess.run(['git', '-C', str(root), 'grep', '-q', '-F', '-e', text, 'HEAD', '--', '.', NOT_MARKDOWN],
+                           capture_output=True, env=verify_repro.clean_environment())
+    if found.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(found.returncode, 'git grep')
+    return found.returncode == 0
+
+
+def docs_only(root):
+    """On a pull_request event, return the changed paths when every one is a .md file that no other tracked file names; else None."""
+    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('GITHUB_EVENT_NAME') != 'pull_request':
+        return None
+    try:
+        raw = verify_repro.git(root, 'diff', '--raw', '-z', '--no-renames', '--ignore-submodules=none',
+                               scan_base(root, pull_request()), 'HEAD')
+        fields = os.fsdecode(raw).split('\0')[:-1]
+        changes = [(fields[i].split()[:2], fields[i + 1]) for i in range(0, len(fields), 2)]
+        paths = sorted({path for _, path in changes})
+        if not paths or any(not path.endswith('.md') or NOT_DOCS_FOLDERS & set(path.split('/')[:-1])
+                            or not PLAIN_FILE_MODES.issuperset(mode.lstrip(':') for mode in modes)
+                            for modes, path in changes):
+            return None
+        for path in paths:
+            folder, _, name = path.rpartition('/')
+            last = folder.rpartition('/')[2]
+            needles = [name] + ([folder, f"'{last}'", f'"{last}"'] if folder else [])
+            if any(named_outside_markdown(root, needle) for needle in needles):
+                return None
+    except Exception:
+        return None
+    return paths
+
+
 def run(root):
     """Return an exit code when the suite must not run, or None to run the full suite."""
     if os.environ.get('GITHUB_ACTIONS') != 'true':

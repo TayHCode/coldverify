@@ -20,7 +20,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 IDENTITY = ['-c', 'user.name=eval', '-c', 'user.email=eval@localhost']
-RECIPE_STEP = re.compile(r"""--step '[^']*' "filtered --suite '([^']+)' -- ([^"]+)\"""")
+RECIPE_STEP = re.compile(r"""verify_filter\.py}" run --suite '([^']+)' -- (.+)$""", re.MULTILINE)
 SUMMARY = re.compile(r'filters: calls=(\d+) model_calls=(\d+) model_failures=(\d+) tokens=(\d+) cost=\$([\d.]+) run=(\d+) skip=(\d+)')
 GROUP = re.compile(r'::group::tests (\S+) \((\d+) of (\d+)\)')
 RAN = re.compile(r'^Ran (\d+) tests?', re.M)

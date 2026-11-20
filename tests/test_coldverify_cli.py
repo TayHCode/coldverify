@@ -177,7 +177,7 @@ class Install(unittest.TestCase):
         where = subprocess.run([str(self.venv / 'bin/python'), '-c', 'import coldverify.ci.console as c; print(c.__file__)'],
                                cwd=self.folder, text=True, capture_output=True, check=True).stdout.strip()
         package = Path(where).parents[1]
-        for shipped in ('coldverify', 'ci/fleet-verify.sh', 'ci/linux-verify.py', 'ci/filter-model.json',
+        for shipped in ('coldverify', 'ci/fleet-verify.sh', 'ci/linux-verify.py', 'ci/npm_content_cache.py', 'ci/filter-model.json',
                         'skills/create-verification-skill/SKILL.md'):
             self.assertTrue((package / shipped).is_file(), shipped)
 

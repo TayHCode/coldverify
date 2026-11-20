@@ -517,6 +517,133 @@ class LessonChecks(Fixture):
         self.assertEqual(output.splitlines()[2:], ['INCOMPLETE: lesson checks could not run: OSError'])
 
 
+class DocsOnly(Fixture):
+    def branch(self, changes, on_main=None):
+        self.repo.git('checkout', '-q', 'main')
+        if on_main:
+            for path, text in on_main.items():
+                Path(self.repo.path, path).parent.mkdir(parents=True, exist_ok=True)
+                Path(self.repo.path, path).write_text(text)
+            self.repo.commit('main')
+        self.repo.git('checkout', '-q', '-B', 'feature', 'main')
+        for path, text in changes.items():
+            if text is None:
+                self.repo.git('rm', '-q', path)
+            else:
+                Path(self.repo.path, path).parent.mkdir(parents=True, exist_ok=True)
+                Path(self.repo.path, path).write_text(text)
+        self.repo.head = self.repo.commit('docs')
+        self.repo.git('checkout', '-q', 'main')
+
+    def docs(self, event='pull_request', actions='true'):
+        self.repo.merge()
+        event_path = self.folder / 'event.json'
+        event_path.write_text(json.dumps({'pull_request': {
+            'body': '', 'head': {'sha': self.repo.head}, 'base': {'sha': self.repo.git('rev-parse', 'main')}}}))
+        env = {'GITHUB_ACTIONS': actions, 'GITHUB_EVENT_NAME': event, 'GITHUB_EVENT_PATH': str(event_path)}
+        with mock.patch.dict(os.environ, env):
+            return verify_fastlane.docs_only(self.repo.path)
+
+    def test_markdown_that_nothing_names_is_docs_only(self):
+        self.branch({'guide/setup.md': 'Setup.\n', 'NOTES.md': 'notes\n'}, on_main={'guide/old.md': 'old\n'})
+        self.assertEqual(self.docs(), ['NOTES.md', 'guide/setup.md'])
+
+    def test_a_deleted_markdown_file_counts_as_a_change(self):
+        self.branch({'guide/setup.md': None}, on_main={'guide/setup.md': 'Setup.\n'})
+        self.assertEqual(self.docs(), ['guide/setup.md'])
+
+    def test_one_code_path_runs_the_full_suite(self):
+        self.branch({'NOTES.md': 'notes\n', 'app.py': 'print(1)\n'})
+        self.assertIsNone(self.docs())
+
+    def test_code_renamed_into_markdown_runs_the_full_suite(self):
+        self.branch({'tool.py': None, 'tool.md': 'print(1)\n'}, on_main={'tool.py': 'print(1)\n'})
+        self.assertIsNone(self.docs())
+
+    def test_a_readme_named_by_a_test_runs_the_full_suite(self):
+        pin = 'from pathlib import Path\nassert "readme" in Path("README.md").read_text()\n'
+        self.branch({'README.md': 'readme, reworded\n'}, on_main={'test_readme.py': pin})
+        self.assertIsNone(self.docs())
+
+    def test_a_name_added_on_main_after_the_fork_runs_the_full_suite(self):
+        self.branch({'NOTES.md': 'more notes\n'}, on_main={'NOTES.md': 'notes\n'})
+        self.repo.git('checkout', '-q', 'main')
+        Path(self.repo.path, 'check.py').write_text('open("NOTES.md")\n')
+        self.repo.commit('reads notes')
+        self.assertIsNone(self.docs())
+
+    def test_a_folder_named_by_code_runs_the_full_suite(self):
+        for reader in ('glob("prompts/*.md")\n', "ROOT / 'prompts'\n", 'ROOT / "prompts"\n'):
+            with self.subTest(reader=reader):
+                self.branch({'prompts/ask.md': 'Ask.\n'}, on_main={'load.py': reader})
+                self.assertIsNone(self.docs())
+
+    def test_another_markdown_file_naming_it_is_still_docs_only(self):
+        self.branch({'guide/setup.md': 'Setup.\n'}, on_main={'INDEX.md': 'See guide/setup.md\n'})
+        self.assertEqual(self.docs(), ['guide/setup.md'])
+
+    def test_markdown_in_test_and_ci_folders_runs_the_full_suite(self):
+        for folder in sorted(verify_fastlane.NOT_DOCS_FOLDERS):
+            with self.subTest(folder=folder):
+                self.branch({f'pkg/{folder}/case.md': 'expected\n'})
+                self.assertIsNone(self.docs())
+
+    def test_a_submodule_update_beside_markdown_runs_the_full_suite(self):
+        self.branch({'NOTES.md': 'notes\n'})
+        self.repo.git('checkout', '-q', 'feature')
+        self.repo.git('config', 'diff.ignoreSubmodules', 'all')
+        self.repo.git('update-index', '--add', '--cacheinfo', f'160000,{self.repo.base},vendor/lib.md')
+        self.repo.git('commit', '-q', '-m', 'bump')
+        self.repo.head = self.repo.git('rev-parse', 'HEAD')
+        self.repo.git('checkout', '-q', 'main')
+        self.assertIsNone(self.docs())
+
+    def test_an_uppercase_md_suffix_is_not_markdown(self):
+        self.branch({'PROGRAM.MD': 'run\n'})
+        self.assertIsNone(self.docs())
+
+    def test_a_reader_with_an_uppercase_md_suffix_still_names_the_file(self):
+        self.branch({'NOTES.md': 'more\n'}, on_main={'NOTES.md': 'notes\n', 'reader.MD': 'open("NOTES.md")\n'})
+        self.assertIsNone(self.docs())
+
+    def test_an_executable_or_symlinked_markdown_file_runs_the_full_suite(self):
+        self.branch({'NOTES.md': 'notes\n'})
+        self.repo.git('checkout', '-q', 'feature')
+        os.chmod(self.repo.path / 'NOTES.md', 0o755)
+        self.repo.head = self.repo.commit('mode')
+        self.repo.git('checkout', '-q', 'main')
+        self.assertIsNone(self.docs())
+        self.branch({'NOTES.md': 'notes\n'})
+        self.repo.git('checkout', '-q', 'feature')
+        Path(self.repo.path, 'tool.md').symlink_to('feature.py')
+        self.repo.head = self.repo.commit('link')
+        self.repo.git('checkout', '-q', 'main')
+        self.assertIsNone(self.docs())
+
+    def test_paths_with_spaces_unicode_and_pathspec_magic_are_read_as_plain_names(self):
+        changes = {'guide/set up.md': 'a\n', 'guide/café.md': 'b\n', ':(glob)x.md': 'c\n'}
+        self.branch(changes)
+        self.assertEqual(self.docs(), sorted(changes))
+
+    def test_only_a_pull_request_in_github_actions_can_be_docs_only(self):
+        self.branch({'NOTES.md': 'notes\n'})
+        self.assertIsNone(self.docs(event='push'))
+        self.assertIsNone(self.docs(actions='false'))
+
+    def test_a_git_error_runs_the_full_suite(self):
+        self.branch({'NOTES.md': 'notes\n'})
+        with mock.patch.object(verify_fastlane, 'named_outside_markdown',
+                               side_effect=subprocess.CalledProcessError(128, 'git grep')):
+            self.assertIsNone(self.docs())
+
+    def test_an_unreadable_event_runs_the_full_suite(self):
+        self.branch({'NOTES.md': 'notes\n'})
+        self.repo.merge()
+        with mock.patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'pull_request',
+                                          'GITHUB_EVENT_PATH': str(self.folder / 'missing.json')}):
+            self.assertIsNone(verify_fastlane.docs_only(self.repo.path))
+
+
 class Environment(unittest.TestCase):
     def test_the_environment_hash_is_stable_and_follows_coldstack(self):
         with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {'COLDSTACK_ROOT': folder}):
@@ -561,6 +688,26 @@ class Command(Fixture):
         self.assertIn('FAIL: secret scan: assigned-secret in config/app.env:2', result.stdout)
         self.assertNotIn('hunter2', result.stdout + result.stderr)
         self.assertFalse((self.folder / 'recipe-ran').exists())
+
+    def test_a_strict_ci_run_of_a_docs_only_change_passes_and_says_the_tests_did_not_run(self):
+        install, env = self.installed()
+        self.repo.git('checkout', '-q', '-B', 'feature', 'main')
+        Path(self.repo.path, 'NOTES.md').write_text('notes\n')
+        self.repo.head = self.repo.commit('docs')
+        self.repo.git('checkout', '-q', '--detach', 'main')
+        self.repo.git('merge', '-q', '--no-ff', '-m', 'merge', self.repo.head)
+        Path(self.folder, 'event.json').write_text(json.dumps({'pull_request': {
+            'number': 1, 'body': self.body, 'title': 'Notes', 'head': {'sha': self.repo.head, 'ref': 'feature'},
+            'base': {'sha': self.repo.git('rev-parse', 'main'), 'ref': 'main'}}}))
+        result = subprocess.run([sys.executable, str(install / 'coldverify/coldverify'), '--ci'], cwd=self.repo.path, env=env,
+                                text=True, capture_output=True, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Secret scan: PASS', result.stdout)
+        self.assertIn('Lesson checks: PASS', result.stdout)
+        self.assertIn('COLDVERIFY CI PASS: docs only (1 .md file(s)', result.stdout)
+        self.assertIn('THE TESTS DID NOT RUN', result.stdout)
+        self.assertFalse((self.folder / 'recipe-ran').exists())
+        self.assertFalse((self.repo.path / '.cold/verify-receipt.json').exists())
 
     def test_coldverify_compat_ci_takes_the_fast_lane_without_running_the_recipe(self):
         install, env = self.installed()

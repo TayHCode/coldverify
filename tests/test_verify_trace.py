@@ -390,6 +390,16 @@ class O(unittest.TestCase):
                 self.assertEqual(saved['result'], 'FAIL')
                 self.assertIn('TESTS FAIL: the JUnit XML records', output)
 
+    def test_signed_failure_after_an_infrastructure_abort_returns_failure_exit(self):
+        script = (
+            """printf '%s' '<testsuite><testcase name="a"><failure/></testcase></testsuite>' > "$COLD_VERIFY_JUNIT_DIR/r.xml"; """
+            f'{shlex.quote(sys.executable)} -c {shlex.quote(SIGN)} "$COLD_VERIFY_JUNIT_DIR/r.xml"; '
+            """printf '%s' '{"infrastructure_phase":"execution"}' > "$COLD_VERIFY_SNAPSHOT_RECEIPT"; exit 2"""
+        )
+        code, output, saved = self.verify_saved(script)
+        self.assertEqual(code, 1, output)
+        self.assertEqual((saved['result'], saved['exit_code']), ('FAIL', 2))
+
     def test_unreadable_junit_xml_never_passes(self):
         good = '<testsuite><testcase name="a"/></testsuite>'
         for bad in ('<testsuite><testcase name="a">', 'not xml at all', '<coverage><testcase name="a"/></coverage>',

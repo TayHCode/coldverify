@@ -22,6 +22,8 @@ import time
 import unittest
 
 TESTS = Path(__file__).resolve().parents[1] / 'tests'
+sys.path.insert(0, str(TESTS.parent / 'ci'))
+from verify_parallel import default_jobs  # noqa: E402
 COUNTS = ('failures', 'errors', 'skipped', 'expectedFailures', 'unexpectedSuccesses')
 CHILD = f'''import json, sys, unittest
 def text(reason):
@@ -29,7 +31,10 @@ def text(reason):
         return str(reason).encode('ascii', 'backslashreplace').decode()
     except Exception:
         return '(a skip reason that cannot be shown)'
-result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1]))
+sys.path.insert(0, {str(TESTS.parent / 'ci')!r})
+from junit_unittest import JUnitResult, JUnitRunner, take_junit_environment
+JUnitResult.junit_dir, JUnitResult.junit_key = take_junit_environment()
+result = JUnitRunner(stream=sys.stderr, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1]))
 fixture_skips = [test.id() for test, _ in result.skipped if type(test).__name__ == '_ErrorHolder']
 counts = {{key: len(getattr(result, key)) for key in {COUNTS!r}}}
 counts['skipped'] -= len(fixture_skips)
@@ -64,7 +69,7 @@ def run_test(test):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--jobs', type=int,
-                        default=len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count() or 1)
+                        default=default_jobs())
     jobs = parser.parse_args().jobs
     if jobs < 1:
         parser.error('--jobs must be at least 1')
@@ -72,6 +77,9 @@ def main():
     found = list(flatten(unittest.defaultTestLoader.discover(str(TESTS), pattern='test*.py', top_level_dir=str(TESTS))))
     module_skips = [item for item in found if type(item).__name__ == 'ModuleSkipped']
     tests = [item for item in found if item not in module_skips]
+    if not found:
+        print(f'FAILED: no test found under {TESTS}')
+        return 2
     alone = [item.id() for item in tests if getattr(getattr(item, item._testMethodName), 'run_alone', False)]
     pooled = [item.id() for item in tests if item.id() not in alone]
     started = time.monotonic()

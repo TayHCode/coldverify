@@ -24,8 +24,9 @@ prompt = sys.stdin.read()
 schema = json.load(open(args[args.index('--output-schema') + 1]))
 cwd = os.getcwd()
 files = sorted(os.path.relpath(os.path.join(top, name), cwd) for top, _, names in os.walk(cwd) for name in names)
+contents = {{name: open(name, 'rb').read().hex() for name in files}} if os.environ.get('SHIM_RECORD_BYTES') else {{}}
 with open(os.environ['CRITERIA_LOG'], 'a') as log:
-    log.write(json.dumps({{'tool': 'codex', 'args': args, 'prompt': prompt, 'files': files}}) + '\\n')
+    log.write(json.dumps({{'tool': 'codex', 'args': args, 'prompt': prompt, 'files': files, 'contents': contents}}) + '\\n')
 if os.environ.get('SHIM_CODEX_FAIL'):
     print(os.environ['SHIM_CODEX_FAIL'], file=sys.stderr)
     sys.exit(1)
@@ -37,6 +38,9 @@ elif 'criteria' in schema['properties']:
         {{'criteria': [{{'id': f'C{{index}}', 'text': text}} for index, (text, _) in enumerate(planned, 1)]}})
 else:
     proofs = json.loads(next(line for line in prompt.splitlines() if line.startswith('PROOF_TESTS_JSON: '))[18:])
+    for line in prompt.splitlines():
+        if line.startswith('FLOW_OBSERVATIONS_JSON: '):
+            proofs.extend(json.loads(line.removeprefix('FLOW_OBSERVATIONS_JSON: ')))
     answer = os.environ.get('SHIM_LINKS') or json.dumps({{'links': [
         {{'id': f'C{{index}}', 'tests': [name for name in proofs if covers and covers in name]}}
         for index, (_, covers) in enumerate(planned, 1)]}})

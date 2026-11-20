@@ -72,11 +72,13 @@ class ReproErrorsReachTheReceipt(unittest.TestCase):
         self.assertEqual(repro, ['INCOMPLETE', 'repro: commit all changes before running the repro gate'])
 
     def test_the_ssh_text_is_bounded_and_secrets_are_redacted(self):
+        self.git('branch', '-m', 'change/add')
         token = 'ghp_' + 'A' * 36
         noise = 'debug1: ' + 'x' * 2000
-        result, repro, _ = self.coldverify(COLD_VERIFY_HOST='runner-a',
+        result, repro, _ = self.coldverify(GITHUB_ACTIONS='true', COLD_VERIFY_HOST='runner-a',
                                            SSH_ERROR=f'{noise}\nfetch https://bot:' f'{token}@github.com failed\nPermission denied (publickey).')
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], 'COLDVERIFY CI FAIL: tests')
         self.assertNotIn(token, repro[1])
         self.assertNotIn(token, (self.repo / '.cold/verify-repro.json').read_text())
         self.assertIn('[redacted]@github.com', repro[1])

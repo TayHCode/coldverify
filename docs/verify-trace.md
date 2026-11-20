@@ -169,8 +169,12 @@ Limit: the signature does not isolate PR code that still runs as the same user.
 A script the unchanged recipe calls, or test code inside the adapter's process,
 can still reach the key. Detecting such changes is the tamper check's job.
 
-- `FAIL` (the failing exit code, or 1): a step failed, the command exited
-  non-zero, or the JUnit XML records a failure or error.
+- `FAIL` (the failing exit code, or 1): a step or command failed, or signed
+  JUnit XML records a failure or error.
+- `INCOMPLETE` (exit 2): the suite launcher reported an infrastructure
+  abort during setup or execution. The required suite gate fails and the
+  receipt names the phase. A signed JUnit failure or error still yields
+  `FAIL` with exit 1.
 - `INCOMPLETE` (exit 2): a step was skipped or reused from the cache, a suite
   ran only part of its tests, a JUnit file has no valid signature or can't be
   read, the XML records no test that ran, or there is no XML at all. Without XML, a count found in the
@@ -235,22 +239,52 @@ that is guaranteed free of secrets.
 1. Claim: the `## Claim` section of the PR description, or `--claim TEXT`.
    A run with no claim is `INCOMPLETE`.
 2. Repro, for every change: select new or changed Python unittest cases and
-   module-level pytest functions (`def test_add(): assert ...`). At least one
-   must be proof: assertion failure on base (exit 1), pass on head (exit 0),
-   and on head it must run at least one changed non-test line inside a
-   function. Lines that run only at module level or while a module is being
-   imported, such as a bumped constant, don't count. The tracer runs inside
-   the test process, so a test written to tamper with it can still forge a
-   hit. A 1/0 test that runs no changed line is `unproven`; if no
-   other test is proof, the repro is `INCOMPLETE` with the reason "proof
-   does not exercise the change". Python subprocesses the test starts are
-   traced too, except ones run with `-I` or `-S`. `--compat` keeps the plain 1/0 rule.
+   module-level pytest functions (`def test_add(): assert ...`). Strict Python
+   replay records the assertion failure on base (exit 1) and pass on head
+   (exit 0) as `unproven` until the runner can independently observe a
+   changed line on the pinned revision. Without another qualifying proof,
+   the repro is `INCOMPLETE` with reason `python-coverage-not-runner-observed`.
+   `--compat` keeps the plain 1/0 rule.
+   Strict mode selects new or changed test-named `.sh` files with a
+   `#!/bin/bash`, `#!/usr/bin/bash`, or `#!/usr/bin/env bash` shebang.
+   Coldverify runs each whole file from the checkout root in the Linux sandbox,
+   using the head test on both sides. The repro receipt records both commands
+   and exits. Exit 0 means pass and exit 1 is the test failure convention.
+   Use exit 2 for setup errors. A missing Bash or a setup exit makes the replay
+   incomplete. A 1/0 replay remains `unproven` pending behavior evidence.
    Go, Rust and JavaScript tests are selected too, one top-level test at a
    time: `go test -run` next to `go.mod`, `cargo test --test` for files directly
    in a crate's `tests/`, and `jest -t` (when `package.json` names jest) or
    `node --test --test-name-pattern` next to `package.json`. A JavaScript test
-   is red only on an assertion failure. Strict mode cannot trace these tests
-   yet, so their 1/0 is `unproven` there; `--compat` accepts it.
+   is red only on an assertion failure. In strict mode, a Go 1/0 case counts
+   as proof when its coverage exceeds the zero-test control for a block that
+   overlaps a changed production line. Blank lines and comments do not count.
+   For Cargo, strict mode compares the passing integration test's Rust
+   coverage with the same binary running zero tests. The selected test must
+   increase the count on a changed non-test Rust line. Install the compiler's
+   matching `llvm-profdata` and `llvm-cov` on the test host, for example with the Rustup
+   `llvm-tools-preview` component. Missing tools or no changed-line hit
+   leave the 1/0 Cargo result `unproven`. The head test output records the reason.
+   From `tests/`, run `python3 -m unittest -v cargo_repro` on a Linux host with
+   those tools to exercise the real Cargo fixture.
+   Node and Jest compare coverage from the passing head case with the same file run with
+   zero cases selected. The repro receipt records a changed JavaScript line
+   reached by the selected case. Without that evidence, a 1/0 replay is
+   `unproven`.
+   `--compat` accepts a 1/0 replay without coverage.
+   To run the strict Jest fixture with npm access, run
+   `python3 -m unittest -v test_verify_repro_languages.FixtureRepos.check_strict_jest_records_the_changed_javascript_line`
+   from `tests/`.
+   For a package that declares Vitest, Coldverify runs the selected named test
+   on base and head using the package's prepared `node_modules`. To prove a
+   changed line ran on head, it compares coverage with the same file collected
+   with zero test cases selected. The package setup must provide either
+   `@vitest/coverage-v8` or `@vitest/coverage-istanbul` for that comparison.
+   To run Coldverify's real Vitest fixture on a test host, copy
+   `tests/fixtures/repro/vitest/base/package.json.fixture` to `package.json`
+   in a scratch directory and run `npm install` there.
+   From `tests/`, run `COLD_TEST_VITEST_MODULES="$prepared_modules" python3 -m unittest -v vitest_repro`
+   with `prepared_modules` set to the absolute path of that `node_modules`.
    A 0/0 test is acceptance; identical non-zero exits are unchanged. Neither
    counts as proof or blocks a proof, except that any exit 1 on head fails.
    A base pass lost on head, or a base assertion failure not passing on head,
@@ -262,8 +296,7 @@ that is guaranteed free of secrets.
    error is an `ImportError` or `AttributeError` for a name the head adds to
    non-test code in that same module or class (a new function, class,
    variable or module). That base error
-   is exit 3, and a head pass that runs a changed line makes the test
-   `missing-on-base`, which counts as proof for a new feature. Pytest functions run under
+   is exit 3, and a head pass records an `unproven` 3/0 replay. Pytest functions run under
    pytest, which is installed for the repro when the project doesn't provide
    it. Pytest test classes are not reproduced yet.
    No such test, uncommitted work, or `--no-repro-reason TEXT` is

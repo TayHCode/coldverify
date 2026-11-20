@@ -8,7 +8,13 @@ import stat
 import time
 import uuid
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
+
+
+class SuitePhase(StrEnum):
+    SETUP = 'setup'
+    EXECUTION = 'execution'
 
 
 def snapshot_tree(root):
@@ -43,19 +49,24 @@ def snapshot_tree(root):
     return digest.hexdigest()
 
 
-def record_snapshot(root):
+def record_snapshot(root, **identity):
     receipt = os.environ.get('COLD_VERIFY_SNAPSHOT_RECEIPT')
     if receipt:
-        Path(receipt).write_text(json.dumps({'snapshot_tree': snapshot_tree(root), 'snapshot_ready_at': time.time()}))
+        Path(receipt).write_text(json.dumps({'snapshot_tree': snapshot_tree(root),
+                                            'snapshot_ready_at': time.time(), **identity}))
 
 
 
 def record_backend(backend):
+    record_run_context(backend=backend)
+
+
+def record_run_context(**fields):
     receipt = os.environ.get('COLD_VERIFY_SNAPSHOT_RECEIPT')
     if receipt:
         path = Path(receipt)
         recorded = json.loads(path.read_text()) if path.exists() else {}
-        path.write_text(json.dumps({**recorded, 'backend': backend}))
+        path.write_text(json.dumps({**recorded, **fields}))
 
 
 def lock(file, blocking=True):

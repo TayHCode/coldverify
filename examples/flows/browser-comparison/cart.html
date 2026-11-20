@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Cart discount</title>
+<style>
+  body { margin: 32px; font: 18px system-ui, sans-serif; color: #172533; background: #f6f7fa; }
+  button { padding: 8px 12px; font: inherit; }
+</style>
+<h1>Cart discount</h1>
+<p id="total" role="status">Total: $20.00</p>
+<button>Apply $2 discount</button>
+<script>
+  const discount = 2;
+  document.querySelector('button').addEventListener('click', () => {
+    document.querySelector('#total').textContent = `Total: $${(20 - discount).toFixed(2)}`;
+  });
+</script>

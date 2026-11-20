@@ -28,7 +28,8 @@ class RetiredFleetCode(unittest.TestCase):
 
     def test_retired_files_are_gone(self):
         for name in ('ci/onboard.py', 'ci/run_result.py', 'ci/run-result.schema.json', 'ci/verify-exceptions.json',
-                     'ci/templates/verify-hosted.yml', 'ci/templates/verify-macos.yml'):
+                     'ci/templates/verify-hosted.yml', 'ci/templates/verify-macos.yml',
+                     'ci/templates/verify-coldbox.yml'):
             self.assertFalse((ROOT / name).exists(), name)
         self.assertEqual(sorted((ROOT / 'ci').rglob('*.ps1')), [])
 

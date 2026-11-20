@@ -1,10 +1,16 @@
+import contextlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import runpy
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import criteria_shim
 
@@ -13,6 +19,8 @@ GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES')
 REFUSE = '#!/usr/bin/env bash\necho "$0 $*" >> "$SHIM_CALLS"\nexit 255\n'
 NO_REMOTE_GH = '#!/usr/bin/env bash\necho "$0 $*" >> "$SHIM_CALLS"\necho "no git remotes found" >&2\nexit 1\n'
+ADD_FLOW = '.fleet/flows/check-add'
+OBSERVE_ADD = 'from calc import add; value = add(2, 3); '
 PYTEST_RECIPE = ('set -euo pipefail\nscratch="$(mktemp -d)"\ntrap \'rm -rf "$scratch"\' EXIT\n'
                  'python3 -m venv "$scratch/venv"\n"$scratch/venv/bin/pip" install -q pytest\n'
                  '"$scratch/venv/bin/python" "$COLD_VERIFY_PYTEST" -q\n')
@@ -74,12 +82,13 @@ class OutsiderRunsLocally(unittest.TestCase):
         configured = self.run_tool(str(ROOT / 'ci/linux-verify.py'), '--platform', str(self.repo), COLD_VERIFY_HOST='runner-a')
         self.assertEqual(configured.stdout.strip(), 'linux-generic', configured.stderr)
 
-    def test_bug_fix_passes_on_this_machine_without_ssh(self):
+    def test_python_bug_fix_replays_on_this_machine_without_ssh(self):
         result = self.run_tool(str(ROOT / 'coldverify'), '--ci', '--builder-model', criteria_shim.BUILDER, '--claim', 'add adds')
         output = result.stdout + result.stderr
-        self.assertEqual(result.returncode, 0, output)
-        self.assertIn('COLDVERIFY PASS', output)
-        self.assertIn('1 repro tests failed on base and passed on head', output)
+        self.assertEqual(result.returncode, 2, output)
+        self.assertIn('COLDVERIFY INCOMPLETE', output)
+        self.assertIn('tests/test_calc.py::Add.test_add: base=1 head=0 (unproven)', output)
+        self.assertIn('python-coverage-not-runner-observed', output)
         self.assertIn('2 tests ran fresh and passed', output)
         self.assertNotIn('ssh', self.shim_calls())
 
@@ -89,6 +98,48 @@ class OutsiderRunsLocally(unittest.TestCase):
             self.write(name, text)
         self.git('add', '-A')
         self.git('commit', '-qm', branch)
+
+    def verify_add_flow(self, branch, script, covers):
+        self.git('switch', '-qc', branch, 'main')
+        self.write('calc.py', 'def add(a, b):\n    return a + b\n')
+        self.write(ADD_FLOW, f"#!/bin/sh\npython3 -c '{OBSERVE_ADD}{script}'\n")
+        (self.repo / ADD_FLOW).chmod(0o755)
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'Add using a flow as proof')
+        claim = 'add(2, 3) returns 5'
+        printed = io.StringIO()
+        with mock.patch.dict(os.environ, {**self.env, 'SHIM_CRITERIA': json.dumps([[claim, covers]])}, clear=True), \
+                mock.patch.object(sys, 'path', sys.path.copy()), contextlib.chdir(self.repo), contextlib.redirect_stdout(printed):
+            code = runpy.run_path(str(ROOT / 'coldverify'))['main'](['--ci', '--builder-model', criteria_shim.BUILDER,
+                                                                   '--claim', claim])
+        return code, json.loads((self.repo / '.cold/verify-receipt.json').read_text()), printed.getvalue()
+
+    def test_an_observed_flow_can_prove_a_claim_without_a_changed_test(self):
+        code, receipt, output = self.verify_add_flow('flow-proof', 'print(value); raise SystemExit(value != 5)', ADD_FLOW)
+        self.assertEqual(receipt['repro']['tests'], [])
+        [flow] = receipt['flows']['flows']
+        self.assertEqual((flow['base_exit'], flow['base_output'], flow['head_exit'], flow['head_output']),
+                         (1, '-1', 0, '5'))
+        self.assertEqual(receipt['acceptance_criteria'],
+                         [{'id': 'C1', 'text': 'add(2, 3) returns 5', 'covered_by': [ADD_FLOW]}])
+        self.assertEqual((code, receipt['result']), (0, 'PASS'), output)
+        prompts = [call['prompt'] for call in criteria_shim.calls(self.env['CRITERIA_LOG']) if call['tool'] == 'codex']
+        self.assertIn(f'FLOW_OBSERVATIONS_JSON: {json.dumps({ADD_FLOW: {"base": "-1", "head": "5"}})}', prompts[-1])
+
+    def test_nonqualifying_flows_leave_the_claim_unverified(self):
+        cases = (
+            ('regression-only', 'print(value)', ADD_FLOW, (0, 0)),
+            ('silent', 'raise SystemExit(value != 5)', ADD_FLOW, (1, 0)),
+            ('irrelevant', 'print(value < 0); raise SystemExit(value < 0)', '', (1, 0)),
+            ('unprovisionable', 'print(value); raise SystemExit(125 if value != 5 else 0)', ADD_FLOW, (125, 0)),
+        )
+        for branch, script, covers, exits in cases:
+            with self.subTest(flow=branch):
+                code, receipt, output = self.verify_add_flow(branch, script, covers)
+                [flow] = receipt['flows']['flows']
+                self.assertEqual((flow['base_exit'], flow['head_exit']), exits, output)
+                self.assertEqual((code, receipt['result']), (2, 'INCOMPLETE'), output)
+                self.assertEqual(receipt['acceptance_criteria'][0]['covered_by'], [])
 
     def test_compat_runs_the_bug_fix_repro_without_a_claim_or_receipt(self):
         result = self.run_tool(str(ROOT / 'coldverify'), '--compat', '--ci')
@@ -140,12 +191,12 @@ class OutsiderRunsLocally(unittest.TestCase):
 
     def test_preview_messages_leave_real_run_verdicts_alone(self):
         strict, verdict, compat, preview, output = self.verdicts()
-        self.assertEqual((strict, verdict, compat, preview), (0, ['COLDVERIFY PASS'], 0, 2), output)
+        self.assertEqual((strict, verdict, compat, preview), (2, ['COLDVERIFY INCOMPLETE'], 0, 2), output)
         self.assertIn('does not support --preview', output)
         self.git('rm', '-q', '.fleet/verify.sh')
         self.git('commit', '-qm', 'Fix add without a recipe')
         strict, verdict, compat, preview, output = self.verdicts()
-        self.assertEqual((strict, verdict, compat, preview), (0, ['COLDVERIFY PASS'], 0, 2), output)
+        self.assertEqual((strict, verdict, compat, preview), (2, ['COLDVERIFY INCOMPLETE'], 0, 2), output)
         self.assertIn('no .fleet/verify.sh recipe', output)
 
     def test_a_recipe_whose_only_subtest_skipped_is_incomplete_even_with_a_red_green_repro(self):
@@ -166,7 +217,9 @@ class OutsiderRunsLocally(unittest.TestCase):
         self.assertEqual(result.returncode, 2, output)
         self.assertIn('COLDVERIFY INCOMPLETE', output)
         receipt = json.loads((self.repo / '.cold/verify-receipt.json').read_text())
-        self.assertEqual(receipt['checks']['repro'], ['PASS', '1 repro tests failed on base and passed on head'])
+        self.assertEqual(receipt['checks']['repro'][0], 'INCOMPLETE')
+        self.assertIn('python-coverage-not-runner-observed', receipt['checks']['repro'][1])
+        self.assertIn('tests/test_calc.py::Add.test_add: base=1 head=0 (unproven)', output)
         self.assertEqual(receipt['checks']['tests'], ['INCOMPLETE', 'the JUnit XML records no test that ran'])
 
     def use_recipe_on_main(self, recipe):
@@ -176,16 +229,19 @@ class OutsiderRunsLocally(unittest.TestCase):
         self.git('commit', '-qm', 'Change the recipe')
         self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
 
-    def test_pytest_bug_fix_passes_with_the_right_counts(self):
-        self.use_recipe_on_main(PYTEST_RECIPE)
+    def test_pytest_bug_fix_replays_with_the_right_counts(self):
+        recipe = (f'{shlex.quote(sys.executable)} "$COLD_VERIFY_PYTEST" -q\n'
+                  if importlib.util.find_spec('pytest') else PYTEST_RECIPE)
+        self.use_recipe_on_main(recipe)
         self.commit_branch('fix/add-pytest', {'calc.py': 'def add(a, b):\n    return a + b\n',
                                               'tests/test_calc_pytest.py': 'import calc\n\n\ndef test_add():\n    assert calc.add(2, 3) == 5\n'})
         result = self.run_tool(str(ROOT / 'coldverify'), '--ci', '--builder-model', criteria_shim.BUILDER, '--claim', 'add adds')
         output = result.stdout + result.stderr
-        self.assertEqual(result.returncode, 0, output)
-        self.assertIn('COLDVERIFY PASS', output)
+        self.assertEqual(result.returncode, 2, output)
+        self.assertIn('COLDVERIFY INCOMPLETE', output)
         receipt = json.loads((self.repo / '.cold/verify-receipt.json').read_text())
-        self.assertEqual(receipt['checks']['repro'], ['PASS', '1 repro tests failed on base and passed on head'])
+        self.assertEqual(receipt['checks']['repro'][0], 'INCOMPLETE')
+        self.assertIn('python-coverage-not-runner-observed', receipt['checks']['repro'][1])
         self.assertEqual(receipt['checks']['tests'], ['PASS', '2 tests ran fresh and passed'])
         repro = json.loads((self.repo / '.cold/verify-repro.json').read_text())
         self.assertEqual([(t['name'], t['base_exit'], t['head_exit']) for t in repro['tests']],

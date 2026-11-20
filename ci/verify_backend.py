@@ -1,12 +1,15 @@
 """Execution backend chosen by COLD_VERIFY_BACKEND: local, ssh:<host>, container:<image>, coldbox or coldbox-api."""
 import contextlib
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -27,6 +30,10 @@ class Unavailable(RuntimeError):
 
 
 class NoApi(Unavailable):
+    pass
+
+
+class ExecutionAborted(Unavailable):
     pass
 
 
@@ -112,10 +119,64 @@ def reply(result, what):
     return value
 
 
+def trusted_suite(root, suite, env):
+    try:
+        root = root.resolve()
+        if Path(os.path.abspath(suite)).is_relative_to(root) or suite.resolve().is_relative_to(root):
+            raise Unavailable('select the suite outside the checkout')
+        coldbox = shutil.which('coldbox')
+        if not coldbox or Path(coldbox).resolve().is_relative_to(root):
+            raise Unavailable('the trusted suite requires a host installation of Coldbox')
+        state = Path(env.get('COLDBOX_STATE', '/var/lib/coldbox')).resolve()
+        receipts = (state / 'receipts').resolve()
+        if state.is_relative_to(root) or receipts.is_relative_to(root):
+            raise Unavailable('the trusted suite requires Coldbox state outside the checkout')
+        commit, tree = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD', 'HEAD^{tree}'],
+                                               env=env, stderr=subprocess.DEVNULL, text=True).splitlines()
+        manifest = suite.read_bytes()
+        with tempfile.TemporaryDirectory(prefix='coldverify-suite-', dir=state) as scratch:
+            snapshot = Path(scratch) / 'suite.json'
+            snapshot.write_bytes(manifest)
+            done = subprocess.run([str(Path(coldbox).resolve()), 'run', '--offline', '--trusted-suite', str(snapshot),
+                                   '--receipts', str(receipts), str(root)], cwd=scratch, env={**env, 'COLDBOX_STATE': str(state)},
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            lines = done.stderr.splitlines()
+            announcement = re.fullmatch(r'coldbox: (?:PASS|FAIL|INCOMPLETE) receipt (.+)', lines[-1]) if lines else None
+            if not announcement:
+                raise Unavailable(f'Coldbox did not identify a host receipt ({reason(done)})')
+            report = Path(announcement[1])
+            if report.parent != receipts or not re.fullmatch(r'cbx-[a-z0-9-]+\.json', report.name) or report.is_symlink():
+                raise Unavailable('Coldbox identified a receipt outside the expected host storage')
+            receipt = json.loads(report.read_bytes())
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        raise Unavailable(f'could not verify the Coldbox suite receipt: {error}') from error
+
+    if not isinstance(receipt, dict) or tuple(receipt.get(key) for key in ('schema', 'id', 'mode', 'sha')) != (
+            'coldbox.receipt/v1', report.stem, 'local', commit):
+        raise Unavailable('the host receipt does not identify this Coldbox run and commit')
+    vm = receipt.get('vm')
+    if not isinstance(vm, dict) or vm.get('name') != report.stem or vm.get('destroyed') is not True:
+        raise Unavailable('the host receipt does not confirm VM teardown')
+    observation = receipt.get('suite_observation')
+    expected = ('coldbox.suite-observation/v1', commit, tree, hashlib.sha256(manifest).hexdigest())
+    if not isinstance(observation, dict) or tuple(observation.get(key) for key in (
+            'schema', 'commit', 'tree', 'suite_sha256')) != expected:
+        raise Unavailable('the host suite observation does not match the revision and suite')
+    count = observation.get('tests_ran')
+    if type(count) is not int or count <= 0:
+        raise Unavailable('Coldbox did not observe a positive test count')
+    outcome = (done.returncode, receipt.get('verdict'), observation.get('result'))
+    if outcome == (0, 'pass', 'PASS'):
+        return 'PASS', f'Coldbox observed {count} tests at {commit}. Receipt {report}'
+    if outcome == (1, 'fail', 'FAIL'):
+        return 'FAIL', f'Coldbox observed a failure after {count} tests at {commit}. Receipt {report}'
+    raise Unavailable('the Coldbox suite did not reach a consistent pass or fail verdict')
+
+
 def submit(repo, sha):
     """Run `coldbox checks` on repo at sha through `coldbox api`; return 0 for pass and 1 for fail, raise NoApi when coldbox has no api."""
     _, run, what = coldbox_host()
-    deadline, shown = time.monotonic() + POLL_LIMIT, None
+    deadline = time.monotonic() + POLL_LIMIT
     submitted = api(run, what, deadline, 'submit', '--repo', repo, '--sha', sha)
     if submitted.returncode == 2 and "invalid choice: 'api'" in submitted.stderr:
         raise NoApi(f'the {what} backend has no api subcommand')
@@ -124,6 +185,14 @@ def submit(repo, sha):
     name = reply(submitted, what).get('id')
     if not isinstance(name, str) or not re.fullmatch(r'cbx-[A-Za-z0-9._-]+', name):
         raise Unavailable(f'the {what} api named an invalid submission {name!r}')
+    try:
+        return await_receipt(run, what, deadline, name, repo, sha)
+    except Unavailable as error:
+        raise ExecutionAborted(str(error)) from error
+
+
+def await_receipt(run, what, deadline, name, repo, sha):
+    shown = None
     while True:
         state = reply(api(run, what, deadline, 'status', name), what).get('state')
         if state in ('done', 'failed'):

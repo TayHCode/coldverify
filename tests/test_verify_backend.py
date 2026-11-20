@@ -30,12 +30,20 @@ SSH_TO_FAKE_HOST = '#!/usr/bin/env bash\necho "ssh $3" >> "$SHIM_CALLS"\nPYTHONP
 NO_REMOTE_GH ='#!/usr/bin/env bash\necho "no git remotes found" >&2\nexit 1\n'
 FAKE_BACKEND = '''#!/usr/bin/env bash
 echo "$(basename "$0") $1 $2" >> "$SHIM_CALLS"
+run_remote() {
+  local remote_prefix=/tmp/cold-
+  local fixture_prefix="${SHIM_CALLS%/*}/cold-"
+  exec "$1" "$2" "${3//"$remote_prefix"/"$fixture_prefix"}"
+}
 case "$1 $2" in
   "run -d"|"vm up")
     [ -n "$FAKE_BACKEND_DOWN" ] && { echo "backend is down" >&2; exit 125; }
     echo fake-box ;;
-  "exec -i") shift 3; exec "$@" ;;
-  "vm exec") shift 4; [ -n "$FAKE_SUITE_STATUS" ] && [ "$3" != "uname -n" ] && exit "$FAKE_SUITE_STATUS"; exec "$@" ;;
+  "exec -i") shift 3; run_remote "$@" ;;
+  "vm exec")
+    shift 4
+    [ -n "$FAKE_SUITE_STATUS" ] && [ "$3" != "uname -n" ] && exit "$FAKE_SUITE_STATUS"
+    run_remote "$@" ;;
   "rm -f") ;;
   "vm down") if [ -n "$FAKE_VM_DOWN_SECONDS" ]; then sleep "$FAKE_VM_DOWN_SECONDS"; echo "$(basename "$0") deleted" >> "$SHIM_CALLS"; fi ;;
   "api "*) echo "coldbox: error: argument command: invalid choice: 'api' (choose from run, vm)" >&2; exit 2 ;;
@@ -139,12 +147,22 @@ class ConfiguredBackend(unittest.TestCase):
     def calls_made(self):
         return self.calls.read_text().splitlines() if self.calls.exists() else []
 
+    def assert_python_replay_incomplete(self, result, receipt):
+        output = result.stdout + result.stderr
+        self.assertEqual((result.returncode, receipt['result']), (2, 'INCOMPLETE'), output)
+        self.assertEqual(receipt['checks']['repro'][0], 'INCOMPLETE')
+        self.assertIn('python-coverage-not-runner-observed', receipt['checks']['repro'][1])
+        self.assertEqual(receipt['checks']['tests'], ['PASS', '2 tests ran fresh and passed'])
+        self.assertIn('tests/test_calc.py::Add.test_add: base=1 head=0 (unproven)', output)
+
     def test_container_backend_runs_the_repro_and_the_suite_in_the_container(self):
         result, receipt = self.verify('container:ubuntu:24.04')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_python_replay_incomplete(result, receipt)
         self.assertEqual((receipt['environment']['backend'], receipt['environment']['isolation']),
                          ('container:ubuntu:24.04', 'container'))
         self.assertEqual(receipt['repro']['backend'], 'container:ubuntu:24.04')
+        self.assertIn('tree', receipt['run'])
+        self.assertEqual((receipt['run']['head'], receipt['run']['tree']), (receipt['commit'], receipt['tree']))
         calls = self.calls_made()
         self.assertEqual(calls.count('docker run -d'), 2, calls)
         self.assertEqual(calls.count('docker rm -f'), 2, calls)
@@ -158,9 +176,14 @@ class ConfiguredBackend(unittest.TestCase):
             os.environ.pop('COLDBOX_GUEST', None)
             in_guest = verify_context.coldbox_guest()
         criteria = receipt['checks'].pop('criteria')
-        self.assertEqual(criteria if in_guest else criteria[0], ['INCOMPLETE', verify_criteria.GUEST] if in_guest else 'PASS')
-        self.assertEqual({check[0] for check in receipt['checks'].values()}, {'PASS'}, result.stdout + result.stderr)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(criteria[0], 'INCOMPLETE')
+        if in_guest:
+            self.assertEqual(criteria[1], verify_criteria.GUEST)
+        else:
+            self.assertIn('acceptance criteria no proof test covers', criteria[1])
+        self.assert_python_replay_incomplete(result, receipt)
+        self.assertEqual({name: check[0] for name, check in receipt['checks'].items()},
+                         {name: 'INCOMPLETE' if name == 'repro' else 'PASS' for name in receipt['checks']})
         self.assertEqual('criteria not evaluated in a CI guest' in receipt['reason'], bool(in_guest), receipt['reason'])
         self.assertEqual((receipt['environment']['backend'], receipt['environment']['isolation']), ('coldbox', 'coldbox-vm'))
         calls = self.calls_made()
@@ -170,7 +193,7 @@ class ConfiguredBackend(unittest.TestCase):
     def test_coldbox_api_without_an_api_subcommand_runs_in_a_disposable_vm(self):
         result, receipt = self.verify('coldbox-api', GITHUB_REPOSITORY='example-org/native-tool')
         output = result.stdout + result.stderr
-        self.assertEqual(result.returncode, 0, output)
+        self.assert_python_replay_incomplete(result, receipt)
         self.assertIn('the coldbox backend has no api subcommand; running in a disposable Coldbox VM instead', output)
         self.assertEqual((receipt['environment']['backend'], receipt['environment']['isolation']), ('coldbox-api', 'coldbox-vm'))
         calls = self.calls_made()
@@ -213,9 +236,8 @@ class ConfiguredBackend(unittest.TestCase):
             with self.subTest(status=status):
                 result, receipt = self.verify('', GITHUB_REPOSITORY='example-org/native-tool', FAKE_SUITE_STATUS=status,
                                                PYTHONPATH=synthetic_policy.shim_folder(self.addCleanup))
-                if status == '3':
-                    self.assertIn('the coldbox backend exited 3 without a verdict', result.stdout + result.stderr)
-                self.assertNotEqual(receipt['checks']['tests'][0], 'PASS')
+                self.assertIn(f'the coldbox backend exited {status} without a verdict', result.stdout + result.stderr)
+                self.assertEqual(receipt['checks']['tests'], ['INCOMPLETE', 'infrastructure aborted during suite execution'])
                 self.assertNotIn('backend', receipt['run'])
                 self.assertIn('coldbox vm up', self.calls_made())
 
@@ -252,9 +274,41 @@ class ConfiguredBackend(unittest.TestCase):
         self.assertNotEqual(receipt['checks']['tests'][0], 'PASS')
         self.assertEqual(self.calls_made(), [])
 
+    def test_required_gate_distinguishes_infrastructure_aborts_from_product_failures(self):
+        self.git('branch', '-m', 'change/add')
+        for backend, recipe, status, reason in (
+            ('kubernetes', 'exit 2\n', 'INCOMPLETE', 'suite setup'),
+            ('local', 'kill -TERM "$$"\n', 'INCOMPLETE', 'suite execution'),
+            ('container:ubuntu:24.04', 'kill -TERM "$$"\n', 'INCOMPLETE', 'suite execution'),
+            ('local', 'echo "INCOMPLETE: suite setup"; exit 2\n', 'FAIL', 'exit 1'),
+            ('container:ubuntu:24.04', 'exit 2\n', 'FAIL', 'exit 1'),
+        ):
+            with self.subTest(backend=backend, recipe=recipe):
+                self.write('.fleet/verify.sh', recipe)
+                result, receipt = self.verify(backend, GITHUB_ACTIONS='true')
+                self.assertEqual(receipt['result'], status, result.stdout + result.stderr)
+                self.assertEqual(receipt['checks']['tests'][0], status)
+                self.assertIn(reason, receipt['checks']['tests'][1])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1], 'COLDVERIFY CI FAIL: tests')
+
+    def test_a_recorded_product_failure_survives_a_later_execution_abort(self):
+        self.git('branch', '-m', 'change/add')
+        self.write('tests/test_other.py', 'import unittest\nclass Other(unittest.TestCase):\n'
+                   '    def test_truth(self):\n        self.assertEqual(1, 2)\n')
+        self.write('.fleet/verify.sh', 'python3 "$COLD_VERIFY_UNITTEST" discover -s tests -v\nkill -TERM "$$"\n')
+        for backend in ('local', 'container:ubuntu:24.04'):
+            with self.subTest(backend=backend):
+                result, receipt = self.verify(backend, GITHUB_ACTIONS='true')
+                self.assertEqual(receipt['checks']['tests'], ['FAIL', 'the JUnit XML records 1 failures and 0 errors'])
+                self.assertEqual(receipt['run'].get('infrastructure_phase'), 'execution')
+                self.assertEqual(receipt['result'], 'FAIL')
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout.splitlines()[-1], 'COLDVERIFY CI FAIL: tests')
+
     def test_local_backend_runs_a_runner_repository_on_this_machine(self):
         result, receipt = self.verify('local', GITHUB_REPOSITORY='example-org/sample')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_python_replay_incomplete(result, receipt)
         self.assertEqual((receipt['environment']['backend'], receipt['environment']['isolation']), ('local', 'local'))
         self.assertEqual(self.calls_made(), [])
 
@@ -461,7 +515,7 @@ class ColdboxApi(unittest.TestCase):
 
     def test_a_failed_submission_is_unavailable_with_its_error(self):
         os.environ['FAKE_RECEIPT_EXIT'] = '125'
-        with self.assertRaisesRegex(verify_backend.Unavailable,
+        with self.assertRaisesRegex(verify_backend.ExecutionAborted,
                                     r'has no pass or fail receipt: exit 125, infra_error: fatal: could not read Username$'):
             self.submit('queued failed')
 

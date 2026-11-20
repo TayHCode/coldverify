@@ -2,7 +2,7 @@
 
 `coldverify --compat --ci` (what ColdStack's verify gate runs in Coldbox CI) does three extra things on a `pull_request`
 event, after the repro gate and before the suite. A strict run does the first two, the secret scan and lesson checks,
-before its repro; it has no fast lane. Code: `ci/verify_fastlane.py`.
+before its repro; it has no fast lane, but a docs-only pull request skips the rest (below). Code: `ci/verify_fastlane.py`.
 
 Every CI run prints `coldverify environment: <sha256>`. The hash covers the guest's installed packages, `python3` and
 `node` versions, this coldverify checkout, the coldstack checkout and the `coldbox` binary.
@@ -87,3 +87,22 @@ permissions:
 ```
 
 `linux-verify.py` removes the token before the recipe runs.
+
+## Docs only (strict merge gate)
+
+In a GitHub Actions `pull_request` run of strict `coldverify --ci`, once the secret scan and lesson checks pass, a
+docs-only change exits 0 without the repro, the suite or the flows, and writes no receipt. It prints
+`COLDVERIFY CI PASS: docs only (N .md file(s), none named by another tracked file). THE TESTS DID NOT RUN on this pull
+request and nothing was verified; the push to main runs the full suite.`
+
+A change is docs only when all of these hold; anything else, or any git error, runs everything as before:
+
+- `git diff --no-renames` from the scan base to `HEAD` changes at least one path, and every path (deletes included)
+  ends in `.md`. A rename is a delete plus an add, so code moved into a `.md` file is not docs only.
+- No path has a `tests`, `test`, `fixtures`, `testdata`, `.github` or `.fleet` folder in it.
+- No tracked file at `HEAD` other than a `.md` file contains the changed file's name (for example `README.md`), its
+  folder path (`docs/design`) or its last folder name in quotes (`'design'`). `HEAD` is the merge CI checked out, so code
+  that main added after the fork counts. A README that a test reads by name therefore runs the suite.
+
+Code that reads every `.md` file without naming the file or its folder (a whole-repository scan) is not caught. Such a
+miss shows on the push to main, which always runs the full suite.

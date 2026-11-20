@@ -3,9 +3,11 @@ import contextlib
 import http.server
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -17,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import verify_backend
+import verify_flow_systemd
 import verify_repro
 from verify_context import host_name, redact
 
@@ -54,6 +57,19 @@ def kind(base_exit, head_exit):
     return 'proof' if base_exit == 1 else 'acceptance'
 
 
+def proof_observations(report, repro):
+    if not report or not repro or not (repro.get('base') and repro.get('head')):
+        return {}
+    if (report['base'], report['head']) != (repro['base'], repro['head']):
+        return {}
+    return {
+        f"{FLOWS}/{flow['name']}": {'base': flow['base_output'], 'head': flow['head_output']}
+        for flow in report['flows']
+        if flow['kind'] == 'proof' and (flow['base_exit'], flow['head_exit']) == (1, 0)
+        and flow['base_output'] and flow['head_output'] and flow['base_output'] != flow['head_output']
+    }
+
+
 def keep(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     data = source.read_bytes()
@@ -63,7 +79,7 @@ def keep(source, destination):
         destination.write_bytes(data)
 
 
-def run_flow(flow, checkout, side, scratch, saved, extra=None):
+def run_flow(flow, checkout, side, scratch, saved, extra=None, sandbox_root=None):
     home = scratch / f'{side}-home'
     produced = scratch / f'{side}-artifacts'
     home.mkdir()
@@ -72,9 +88,17 @@ def run_flow(flow, checkout, side, scratch, saved, extra=None):
     env.update({key: os.environ[key] for key in PASSED_THROUGH if key in os.environ}, COLD_FLOW_ARTIFACTS=str(produced))
     env.update(extra or {})
     log = scratch / f'{side}.log'
-    with log.open('wb') as output:
+    with log.open('w+b') as output:
         try:
-            code = verify_repro.run_test([str(flow)], checkout, env, output=output, errors=subprocess.STDOUT)
+            if sandbox_root is not None:
+                prefix = verify_repro.sandbox(sandbox_root, (checkout, home, produced), False,
+                                              optional_readable=(sys.prefix, sys.base_prefix))
+                if verify_flow_systemd.needs_manager(flow):
+                    code = verify_flow_systemd.run(prefix, flow, checkout, env, output, log.with_suffix('.exit'))
+                else:
+                    code = verify_repro.run_sandboxed(prefix, [str(flow)], checkout, env, output=output)
+            else:
+                code = verify_repro.run_test([str(flow)], checkout, env, output=output, errors=subprocess.STDOUT)
         except OSError as error:
             output.write(str(error).encode())
             code = 127
@@ -170,6 +194,8 @@ def run_both(root, name, base, head, folder, remote=None):
         for side, commit in (('base', base), ('head', head)):
             verify_repro.setup_git(root, 'worktree', 'add', '--detach', str(checkouts[side]), commit)
             added.append(checkouts[side])
+        if (checkouts['base'] / '.fleet').is_symlink():
+            raise verify_repro.NoRepro('the base worktree has a symlinked .fleet directory')
         shutil.rmtree(checkouts['base'] / FLOWS, ignore_errors=True)
         shutil.copytree(checkouts['head'] / FLOWS, checkouts['base'] / FLOWS, symlinks=True)
         result = {'name': name, 'commands': []}
@@ -178,7 +204,8 @@ def run_both(root, name, base, head, folder, remote=None):
             if remote:
                 code, output, command = run_remote(remote, flow, checkouts[side], side, folder, saved)
             else:
-                code, output = run_flow(flow, checkouts[side], side, folder, saved)
+                sandbox_root = root if platform.system() == 'Linux' else None
+                code, output = run_flow(flow, checkouts[side], side, folder, saved, sandbox_root=sandbox_root)
                 command = f'cd {shlex.quote(str(checkouts[side]))} && {shlex.quote(str(flow))}'
             result.update({f'{side}_exit': code, f'{side}_output': output})
             result['commands'].append(command)
@@ -448,13 +475,14 @@ def deployed(root, target):
     return save(root, result, reason, None, head, flows, contact=contact)
 
 
-def run(root):
+def run(root, repro=None):
     root = Path(root)
     reset(root)
-    try:
-        repro = json.loads((root / REPRO).read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        repro = {}
+    if repro is None:
+        try:
+            repro = json.loads((root / REPRO).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            repro = {}
     base, head = repro.get('base'), repro.get('head')
     try:
         if not any(declared(root, commit) for commit in dict.fromkeys(('HEAD', head, base)) if commit and present(root, commit)):

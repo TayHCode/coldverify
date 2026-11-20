@@ -261,8 +261,10 @@
         "result": {"$ref": "#/$defs/verdict"},
         "reason": {"type": "string"},
         "head": {"type": ["string", "null"]},
+        "tree": {"type": ["string", "null"]},
         "command": {"type": "array", "items": {"type": "string"}},
         "exit_code": {"type": "integer"},
+        "infrastructure_phase": {"enum": ["setup", "execution"]},
         "tests_ran": {"type": "integer"},
         "tests_source": {"enum": ["junit", "output", null]},
         "steps": {

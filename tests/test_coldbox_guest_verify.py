@@ -93,21 +93,25 @@ class ColdboxGuestVerify(unittest.TestCase):
                 self.assertIn('Repro gate: PASS', output)
                 self.assertIn(f'PASS: real Linux verification on {host}', output)
 
-    def test_strict_coldverify_in_a_guest_of_every_listed_host_passes_all_but_criteria_without_ssh(self):
+    def test_strict_coldverify_in_a_guest_of_every_listed_host_replays_without_ssh(self):
         for host in COLDBOX_HOSTS:
             with self.subTest(host=host):
                 self.as_guest_of(host)
                 code, output, calls = self.coldverify('--ci', '--builder-model', criteria_shim.BUILDER, '--claim', 'add adds')
                 self.assertNotIn('ssh', calls)
-                self.assertEqual(code, 0, output)
+                self.assertEqual(code, 2, output)
                 receipt = json.loads((self.repo / '.cold/verify-receipt.json').read_text())
                 checks = receipt['checks']
                 self.assertEqual(checks.pop('criteria'), ['INCOMPLETE', verify_criteria.GUEST])
+                repro = checks.pop('repro')
+                self.assertEqual(repro[0], 'INCOMPLETE')
+                self.assertIn('python-coverage-not-runner-observed', repro[1])
+                self.assertIn('tests/test_calc.py::Add.test_add: base=1 head=0 (unproven)', output)
                 self.assertEqual({name: result for name, (result, _) in checks.items()},
                                  {name: 'PASS' for name in checks}, output)
-                self.assertEqual(receipt['result'], 'PASS')
+                self.assertEqual(receipt['result'], 'INCOMPLETE')
                 self.assertIn('criteria not evaluated in a CI guest', receipt['reason'])
-                self.assertRegex(output, r'COLDVERIFY PASS: .*criteria not evaluated in a CI guest')
+                self.assertRegex(output, r'COLDVERIFY INCOMPLETE: .*criteria not evaluated in a CI guest')
                 self.assertIn(f'| criteria | INCOMPLETE | {verify_criteria.GUEST} |', output)
                 evidence = json.loads((self.repo / '.cold/verify-evidence.json').read_text())
                 self.assertEqual(evidence['outcome'], 'incomplete')
@@ -121,6 +125,16 @@ class ColdboxGuestVerify(unittest.TestCase):
         self.assertIsNone(receipt['repro'].get('backend'), receipt['repro'])
         self.assertEqual((receipt['environment']['backend'], receipt['environment']['isolation']), ('local', 'coldbox-guest'))
         self.assertEqual(receipt['run']['backend'], 'local', output)
+
+    def test_strict_coldverify_in_a_guest_replays_without_a_host_supplied_builder(self):
+        code, output, _ = self.coldverify('--ci', '--claim', 'add adds')
+        self.assertEqual(code, 2, output)
+        receipt = json.loads((self.repo / '.cold/verify-receipt.json').read_text())
+        self.assertEqual(receipt['result'], 'INCOMPLETE')
+        self.assertIn('python-coverage-not-runner-observed', receipt['checks']['repro'][1])
+        self.assertEqual(receipt['checks']['tests'], ['PASS', '2 tests ran fresh and passed'])
+        self.assertEqual(receipt['checks']['criteria'], ['INCOMPLETE', verify_criteria.GUEST])
+        self.assertEqual(criteria_shim.calls(Path(self.env['CRITERIA_LOG'])), [])
 
     def test_strict_coldverify_without_the_guest_marker_still_needs_criteria(self):
         self.marker.unlink()

@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+
+unprovisioned() {
+    echo "cannot provision: $*"
+    exit 125
+}
+
+[ "${XDG_RUNTIME_DIR:-}" = /run/coldverify ] &&
+    [ "${DBUS_SESSION_BUS_ADDRESS:-}" = unix:path=/run/coldverify/bus ] &&
+    [ -S "$XDG_RUNTIME_DIR/bus" ] ||
+    unprovisioned 'the Coldverify private systemd manager is unavailable'
+[ -f deploy/coldpass-archive.service ] && [ -f deploy/archive-to-nas.sh ] ||
+    unprovisioned 'the archive unit and script are missing'
+[ -d "${COLD_FLOW_ARTIFACTS:-}" ] || unprovisioned 'the flow artifact directory is unavailable'
+
+unit=coldverify-archive.service
+units=$XDG_RUNTIME_DIR/systemd/user
+scratch=$XDG_RUNTIME_DIR/archive
+mkdir -p "$units/$unit.d" "$scratch/input/local" "$scratch/destination" ||
+    unprovisioned 'could not create the archive fixture'
+echo 'archive fixture' > "$scratch/input/local/sample.txt" || unprovisioned 'could not write archive input'
+cp deploy/coldpass-archive.service "$units/$unit" || unprovisioned 'could not copy the archive unit'
+cat > "$units/$unit.d/fixture.conf" <<'UNIT' || unprovisioned 'could not configure the archive fixture'
+[Unit]
+ConditionHost=
+[Service]
+RemainAfterExit=yes
+Environment=COLDPASS_ARCHIVE_NAS=
+Environment=COLDPASS_ARCHIVE_ROOT=%t/archive/input
+Environment=COLDPASS_ARCHIVE_DEST=%t/archive/destination
+Environment=COLDPASS_ARCHIVE_STATE=%t/archive/state
+ExecStart=
+ExecStart=/bin/bash ${ARCHIVE_SCRIPT}
+StandardOutput=file:%t/archive/output.txt
+StandardError=file:%t/archive/error.txt
+UNIT
+
+systemctl --user set-environment "ARCHIVE_SCRIPT=$PWD/deploy/archive-to-nas.sh" ||
+    unprovisioned 'could not set the fixture script path'
+systemctl --user daemon-reload || unprovisioned 'could not load the fixture unit'
+started=0
+systemctl --user start "$unit" || started=$?
+properties=$(systemctl --user show "$unit" --property=Result --property=ExecMainCode --property=ExecMainStatus) ||
+    unprovisioned 'could not read the archive service result'
+printf '%s\n' "$properties" > "$COLD_FLOW_ARTIFACTS/unit-result.txt" ||
+    unprovisioned 'could not save unit result'
+for stream in output error; do
+    [ ! -f "$scratch/$stream.txt" ] ||
+        cp "$scratch/$stream.txt" "$COLD_FLOW_ARTIFACTS/archive-$stream.txt" ||
+        unprovisioned "could not save archive $stream"
+done
+
+status=$(printf '%s\n' "$properties" | sed -n 's/^ExecMainStatus=//p')
+printf '%s\n' "$properties" | grep -qx 'ExecMainCode=1' ||
+    unprovisioned 'the archive command did not exit normally'
+if [ "$started" -ne 0 ]; then
+    [ ! -f "$scratch/error.txt" ] || cat "$scratch/error.txt"
+    if [ "$status" -gt 0 ] && [ "$status" -lt 125 ]; then
+        echo "Archive command exited $status."
+        exit 1
+    fi
+    unprovisioned 'the archive service failed to start'
+fi
+[ "$status" = 0 ] && printf '%s\n' "$properties" | grep -qx 'Result=success' ||
+    unprovisioned 'the archive command did not run to completion'
+[ -f "$scratch/output.txt" ] || unprovisioned 'the service did not write archive output'
+expected=$(hostname -s) || unprovisioned 'could not read the guest hostname'
+observed=$(sed -n 's/^archive-to-nas: host=\([^ ]*\).*/\1/p' "$scratch/output.txt")
+[ -n "$observed" ] || unprovisioned 'the archive command reported no source host'
+printf 'Result=success. Archive source host=%s. Guest hostname=%s.\n' "$observed" "$expected"
+[ "$observed" = "$expected" ]

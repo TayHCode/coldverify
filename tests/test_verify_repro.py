@@ -672,20 +672,45 @@ class ProofMustExerciseTheChange(unittest.TestCase):
         self.assertEqual((code, receipt['result']), (2, 'INCOMPLETE'))
         self.assertIn('proof does not exercise the change', receipt['error'])
 
-    def test_a_test_that_runs_the_fixed_function_is_proof(self):
-        code, receipt = self.gate(self.FIXED_LOGIN, self.LOGIN_TEST)
-        self.assertEqual((code, receipt['result']), (0, 'PASS'))
-        self.assertEqual([(t['base_exit'], t['head_exit'], t['kind']) for t in receipt['tests']], [(1, 0, 'proof')])
+    def test_candidate_hit_reports_are_not_strict_proof(self):
+        from unittest.mock import patch
 
-    def test_a_fix_run_through_a_python_subprocess_is_proof(self):
+        def replay(root, writable, command, directory, env, capture=None, **kwargs):
+            if command[2] == '--list':
+                Path(command[-1]).write_text('["V.test_login_fixed"]')
+                return 0
+            capture.append('')
+            if directory.name == 'base':
+                return 1
+            (Path(env['HOME']) / 'hits.json').write_text(report)
+            return 0
+
+        for report in ('[]', 'not json', '["app.py", 100]', '["app.py", 2]'):
+            with self.subTest(report=report), patch.object(repro.platform, 'system', return_value='Linux'), \
+                    patch.object(repro, 'isolated_test', replay):
+                code, receipt = self.gate(self.FIXED_LOGIN, self.VERSION_TEST)
+                self.assertEqual((code, receipt['result']), (2, 'INCOMPLETE'))
+                self.assertEqual([(t['base_exit'], t['head_exit'], t['kind']) for t in receipt['tests']],
+                                 [(1, 0, 'unproven')])
+
+    def assert_unobserved_replay(self, code, receipt):
+        self.assertEqual((code, receipt['result']), (2, 'INCOMPLETE'))
+        self.assertIn('python-coverage-not-runner-observed', receipt['error'])
+        self.assertEqual([(t['base_exit'], t['head_exit'], t['kind']) for t in receipt['tests']], [(1, 0, 'unproven')])
+
+    def test_a_real_python_replay_records_both_exits_without_proof(self):
+        code, receipt = self.gate(self.FIXED_LOGIN, self.LOGIN_TEST)
+        self.assert_unobserved_replay(code, receipt)
+
+    def test_a_fix_run_through_a_python_subprocess_replays_without_proof(self):
         test = ('import os, subprocess, sys, unittest\nROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n'
                 'class V(unittest.TestCase):\n def test_login_fixed(self):\n'
                 '  out = subprocess.run([sys.executable, "-c", "import app; print(app.login(True))"], cwd=ROOT, capture_output=True, text=True).stdout\n'
                 '  self.assertEqual(out.strip(), "True")\n')
         code, receipt = self.gate(self.FIXED_LOGIN, test)
-        self.assertEqual((code, receipt['result']), (0, 'PASS'))
+        self.assert_unobserved_replay(code, receipt)
 
-    def test_a_traced_subprocess_still_loads_the_projects_own_sitecustomize(self):
+    def test_a_replay_subprocess_still_loads_the_projects_own_sitecustomize(self):
         test = ('import os, subprocess, sys, unittest\nROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n'
                 'class V(unittest.TestCase):\n def test_login_fixed(self):\n'
                 '  env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [os.environ.get("PYTHONPATH"), os.path.join(ROOT, "hooks")])))\n'
@@ -694,17 +719,17 @@ class ProofMustExerciseTheChange(unittest.TestCase):
                 '  self.assertEqual(out.strip(), "True")\n')
         app = self.FIXED_LOGIN
         code, receipt = self.gate(app, test, extra={'hooks/sitecustomize.py': 'import builtins\nbuiltins.PROJECT_HOOK = True\n'})
-        self.assertEqual((code, receipt['result']), (0, 'PASS'))
+        self.assert_unobserved_replay(code, receipt)
 
-    def test_a_changed_file_with_a_quoted_git_path_is_traced(self):
+    def test_a_changed_file_with_a_quoted_git_path_replays_without_proof(self):
         test = self.LOGIN_TEST.replace('import app\n', 'import importlib\napp = importlib.import_module("appé")\n')
         code, receipt = self.gate(self.FIXED_LOGIN, test, app_name='appé.py')
-        self.assertEqual((code, receipt['result']), (0, 'PASS'))
+        self.assert_unobserved_replay(code, receipt)
 
-    def test_a_deletion_only_fix_counts_the_lines_around_it(self):
+    def test_a_deletion_only_fix_replays_without_proof(self):
         base = 'def login(expired):\n    if expired:\n        return False\n    return True\n'
         code, receipt = self.gate('def login(expired):\n    return True\n', self.LOGIN_TEST, base_app=base)
-        self.assertEqual((code, receipt['result']), (0, 'PASS'))
+        self.assert_unobserved_replay(code, receipt)
 
     def test_an_installed_copy_maps_back_to_the_changed_source(self):
         import contextlib
@@ -753,21 +778,21 @@ class NewFeatureMissingOnBase(unittest.TestCase):
         code, receipt = self.gate(app, test, **options)
         return code, receipt['result'], [(t['base_exit'], t['head_exit'], t['kind']) for t in receipt['tests']]
 
-    def test_repro_b_an_import_of_the_new_function_is_missing_on_base_and_passes(self):
-        self.assertEqual(self.outcome(self.FEATURE, self.IMPORT_TEST), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+    def test_repro_b_an_import_of_the_new_function_replays_without_proof(self):
+        self.assertEqual(self.outcome(self.FEATURE, self.IMPORT_TEST), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_an_attribute_the_head_adds_is_missing_on_base(self):
         test = 'import unittest\nimport app\nclass M(unittest.TestCase):\n def test_multiply(self):\n  self.assertEqual(app.multiply(2, 3), 6)\n'
-        self.assertEqual(self.outcome(self.FEATURE, test), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+        self.assertEqual(self.outcome(self.FEATURE, test), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_pytest_function_importing_the_new_function_is_missing_on_base(self):
         test = 'from app import multiply\ndef test_multiply():\n    assert multiply(2, 3) == 6\n'
-        self.assertEqual(self.outcome(self.FEATURE, test), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+        self.assertEqual(self.outcome(self.FEATURE, test), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_new_module_is_missing_on_base(self):
         test = 'import unittest\nfrom maths import multiply\nclass M(unittest.TestCase):\n def test_multiply(self):\n  self.assertEqual(multiply(2, 3), 6)\n'
         maths = {'maths.py': 'def multiply(a, b):\n    return a * b\n'}
-        self.assertEqual(self.outcome(self.BASE_APP, test, head_extra=maths), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+        self.assertEqual(self.outcome(self.BASE_APP, test, head_extra=maths), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_missing_name_the_head_does_not_define_is_only_an_error(self):
         app = self.BASE_APP + 'globals()["multiply"] = lambda a, b: a * b\ndef touched():\n    multiply = 1\n    return multiply\n'
@@ -790,25 +815,25 @@ class NewFeatureMissingOnBase(unittest.TestCase):
         base = {'src/pkg/__init__.py': '', 'src/pkg/maths.py': 'def add(a, b):\n    return a + b\n'}
         head = {'src/pkg/maths.py': 'def add(a, b):\n    return a + b\ndef multiply(a, b):\n    return a * b\n'}
         test = test.replace('import unittest\n', 'import os, sys, unittest\nsys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))\n')
-        self.assertEqual(self.outcome(self.BASE_APP, test, extra=base, head_extra=head), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+        self.assertEqual(self.outcome(self.BASE_APP, test, extra=base, head_extra=head), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_method_added_to_a_parent_class_counts_through_a_child(self):
         base = 'class Parent:\n    pass\nclass Child(Parent):\n    pass\n'
         app = 'class Parent:\n    def feature(self):\n        return 2\nclass Child(Parent):\n    pass\n'
         test = 'import unittest\nimport app\nclass M(unittest.TestCase):\n def test_feature(self):\n  self.assertEqual(app.Child().feature(), 2)\n'
-        self.assertEqual(self.outcome(app, test, base_app=base), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+        self.assertEqual(self.outcome(app, test, base_app=base), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_renamed_module_is_missing_on_base_under_its_new_name(self):
         test = 'import unittest\nfrom renamed import multiply\nclass M(unittest.TestCase):\n def test_multiply(self):\n  self.assertEqual(multiply(2, 3), 6)\n'
         old = 'def multiply(a, b):\n    return a + b\n' + 'x = 1\n' * 20
         self.assertEqual(self.outcome(old.replace('a + b', 'a * b'), test, base_app=old, app_name='renamed.py', rename='orig.py'),
-                         (0, 'PASS', [(3, 0, 'missing-on-base')]))
+                         (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_method_added_to_one_class_counts_when_another_class_has_it(self):
         base = 'class A:\n    def run(self):\n        return 1\nclass B:\n    pass\n'
         app = 'class A:\n    def run(self):\n        return 1\nclass B:\n    def run(self):\n        return 2\n'
         test = 'import unittest\nimport app\nclass M(unittest.TestCase):\n def test_run(self):\n  self.assertEqual(app.B().run(), 2)\n'
-        self.assertEqual(self.outcome(app, test, base_app=base), (0, 'PASS', [(3, 0, 'missing-on-base')]))
+        self.assertEqual(self.outcome(app, test, base_app=base), (2, 'INCOMPLETE', [(3, 0, 'unproven')]))
 
     def test_a_new_constant_read_only_at_import_is_not_proof(self):
         test = 'import unittest\nfrom app import FACTOR\nclass M(unittest.TestCase):\n def test_factor(self):\n  self.assertEqual(FACTOR, 3)\n'

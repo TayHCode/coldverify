@@ -11,9 +11,10 @@ import subprocess
 import tempfile
 import uuid
 
+import verify_backend
 import verify_policy
 import inspect
-from verify_context import snapshot_tree
+from verify_context import SuitePhase, record_run_context, snapshot_tree
 
 
 def git(directory, *args):
@@ -46,6 +47,7 @@ try:
   if path.is_symlink() and not path.resolve().is_relative_to(checkout.resolve()):
    raise SystemExit('INCOMPLETE: repository symlink escapes the native checkout')
  env=os.environ.copy()
+ env.pop('COLD_VERIFY_SNAPSHOT_RECEIPT',None)
  for name in ['GH_TOKEN','GITHUB_TOKEN','FLEET_GITHUB_APP','OPENAI_API_KEY','ANTHROPIC_API_KEY','CLAUDE_CODE_OAUTH_TOKEN','CODEX_API_KEY','XAI_API_KEY','GROK_API_KEY']:
   env.pop(name,None)
  for name,folder in [('HOME','home'),('TMPDIR','scratch'),('XDG_CONFIG_HOME','config'),('XDG_STATE_HOME','state'),('XDG_CACHE_HOME','cache'),('XDG_DATA_HOME','data')]:
@@ -111,22 +113,32 @@ def verify(directory):
         command = [sys.executable, '-', path, sha, tree, host, repo]
     else:
         command = ['ssh', *options, host, shlex.join(['python3', '-', path, sha, tree, host, repo])]
-    result = subprocess.run(command, input=REMOTE.replace('__SNAPSHOT_FUNCTION__', inspect.getsource(snapshot_tree)), text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=3600)
+    try:
+        result = subprocess.run(command, input=REMOTE.replace('__SNAPSHOT_FUNCTION__', inspect.getsource(snapshot_tree)), text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise verify_backend.ExecutionAborted('native macOS verification did not finish') from error
     print(result.stdout, end='', flush=True)
     records = [line.removeprefix('FLEET_NATIVE_RECEIPT ') for line in result.stdout.splitlines() if line.startswith('FLEET_NATIVE_RECEIPT ')]
     if not records:
+        if result.returncode < 0 or result.returncode == 255:
+            raise verify_backend.ExecutionAborted('native macOS verification transport ended without a receipt')
         raise RuntimeError('native macOS verification has no receipt')
     receipt = json.loads(records[-1])
     if (receipt.get('repo') != repo or receipt.get('sha') != sha or receipt.get('tree') != tree or receipt.get('host', '').casefold() != host.casefold()
             or receipt.get('platform') != 'macos'):
         raise RuntimeError('native macOS receipt identity differs')
-    if os.environ.get('COLD_VERIFY_SNAPSHOT_RECEIPT'):
-        Path(os.environ['COLD_VERIFY_SNAPSHOT_RECEIPT']).write_text(json.dumps({'snapshot_tree': receipt.get('snapshot_tree'), 'backend': 'local' if native else 'ssh:' + host}))
-    if receipt.get('exit_code') != 0 or receipt.get('clean') is not True:
+    exit_code = receipt.get('exit_code')
+    if type(exit_code) is not int:
+        raise verify_backend.ExecutionAborted('native macOS receipt has no suite exit code')
+    record_run_context(snapshot_tree=receipt.get('snapshot_tree'), suite_head=sha, suite_tree=tree,
+                       backend='local' if native else 'ssh:' + host)
+    if exit_code < 0:
+        raise verify_backend.ExecutionAborted('native macOS suite was terminated')
+    if exit_code or receipt.get('clean') is not True:
         raise subprocess.CalledProcessError(result.returncode or 1, ['native-macos-suite'])
     if result.returncode:
-        raise RuntimeError('native macOS transport failed')
+        raise verify_backend.ExecutionAborted('native macOS transport failed')
     return receipt
 
 
@@ -138,5 +150,11 @@ if __name__ == '__main__':
         verify(args.directory.resolve())
     except subprocess.CalledProcessError:
         raise SystemExit('FAIL: native macOS suite failed; inspect retained native logs') from None
+    except verify_backend.ExecutionAborted:
+        record_run_context(infrastructure_phase=SuitePhase.EXECUTION)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-        raise SystemExit('INCOMPLETE: native macOS verification failed; inspect retained native logs') from None
+        record_run_context(infrastructure_phase=SuitePhase.SETUP)
+    else:
+        sys.exit(0)
+    print('INCOMPLETE: native macOS verification failed; inspect retained native logs', file=sys.stderr)
+    sys.exit(2)

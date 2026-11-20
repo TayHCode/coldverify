@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,7 +64,28 @@ class CriteriaCheck(unittest.TestCase):
                     if not key.startswith(('GITHUB_', 'COLD_', 'COLDBOX_', 'FAKE_', 'GIT_'))}
         self.env.update(PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}', FAKE_GH_LOG=str(self.log), GITHUB_REPOSITORY='o/r',
                         COLDBOX_GUEST='0', **criteria_shim.install(bin_dir, self.criteria_log))
+        self.env['HOME'] = str(base)
+        self.state = base / '.t3/userdata/statev2.sqlite'
+        self.state.parent.mkdir(parents=True)
+        with contextlib.closing(sqlite3.connect(self.state)) as db, db:
+            db.executescript('''
+                CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, payload_json TEXT);
+                CREATE TABLE orchestration_v2_projection_runs (thread_id TEXT, payload_json TEXT);
+            ''')
+        self.link_builder('builder', criteria_shim.BUILDER)
         self.body = f'## Claim\nSets the value to 1\n\n## Notes\nBuilder-Model: {criteria_shim.BUILDER}\n'
+
+    def link_builder(self, thread, *models, repository='o/r', number=7, host='github.com', other_number=None):
+        link = {'host': host, 'repository': repository, 'number': number, 'source': 'agent'}
+        links = [link] if other_number is None else [{**link, 'number': other_number}, link]
+        with contextlib.closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('INSERT INTO orchestration_v2_projection_threads VALUES (?, ?)',
+                       (thread, json.dumps({'pullRequests': links})))
+            db.executemany('INSERT INTO orchestration_v2_projection_runs VALUES (?, ?)',
+                           [(thread, json.dumps({'modelSelection': {'model': model}})) for model in models])
+
+    def pull(self, body):
+        return {'head': {'sha': self.head}, 'base': {'sha': self.base, 'repo': {'full_name': 'o/r'}}, 'body': body}
 
     def commit(self, message, files):
         for name, text in files.items():
@@ -83,11 +106,10 @@ class CriteriaCheck(unittest.TestCase):
         return {'user': {'login': author}, 'html_url': 'https://github.com/o/r/pull/7#issuecomment-1',
                 'body': verify_receipt.markdown(receipt)}
 
-    def check(self, *args, comments=None, body=None, builders=(criteria_shim.BUILDER,), **env):
-        pull = {'head': {'sha': self.head}, 'base': {'sha': self.base}, 'body': self.body if body is None else body}
+    def check(self, *args, comments=None, body=None, **env):
+        pull = self.pull(self.body if body is None else body)
         comments = [self.receipt_comment()] if comments is None else comments
-        named = [arg for model in builders for arg in ('--builder-model', model)]
-        done = subprocess.run([sys.executable, str(ROOT / 'coldverify'), '--criteria-check', '7', *named, *args], cwd=self.repo, text=True,
+        done = subprocess.run([sys.executable, str(ROOT / 'coldverify'), '--criteria-check', '7', *args], cwd=self.repo, text=True,
                               capture_output=True, env={**self.env, 'FAKE_PULL': json.dumps(pull),
                                                         'FAKE_COMMENTS': json.dumps(comments), **env})
         return done, done.stdout.rstrip().splitlines()[-1]
@@ -96,6 +118,16 @@ class CriteriaCheck(unittest.TestCase):
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return [json.loads(call['body']) for call in calls if call['args'][-1].endswith('/check-runs')]
 
+    def check_snapshot(self, *, body=None, comments=None, **env):
+        pull = self.pull(self.body if body is None else body)
+        comments = [self.receipt_comment()] if comments is None else comments
+        printed = io.StringIO()
+        with mock.patch.dict(os.environ, {**self.env, 'FAKE_PULL': json.dumps(pull),
+                                         'FAKE_COMMENTS': json.dumps(comments), **env}, clear=True), \
+                contextlib.redirect_stdout(printed), contextlib.chdir(self.repo), mock.patch.object(sys, 'path', sys.path.copy()):
+            code = runpy.run_path(str(ROOT / 'coldverify'))['main'](['--criteria-check', '7'])
+        return code, printed.getvalue().rstrip().splitlines()[-1]
+
     def test_a_strict_receipt_for_the_head_gives_a_published_criteria_list(self):
         done, last = self.check('--publish-check')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -103,110 +135,175 @@ class CriteriaCheck(unittest.TestCase):
         (run,) = self.published()
         self.assertEqual((run['name'], run['head_sha'], run['conclusion']), ('coldverify criteria', self.head, 'success'))
         self.assertIn('Informational only', run['output']['summary'])
-        self.assertIn('Builder named by whoever ran this check (--builder-model)', run['output']['summary'])
+        self.assertIn('Builder source: T3 PR link', run['output']['summary'])
         result = json.loads(run['output']['text'])
-        self.assertEqual(result['builder_source'], 'coldverify --builder-model')
+        self.assertEqual(result['builder_source'], 'T3 PR link')
         self.assertEqual(result['acceptance_criteria'], [{'id': 'C1', 'text': 'the claim holds', 'covered_by': [PROOF]}])
         self.assertEqual(result['criteria_verifier']['model'], 'gpt-6.1-terra')
         derive, _ = [call for call in criteria_shim.calls(self.criteria_log) if call['tool'] == 'codex']
         self.assertIn('Sets the value to 1', derive['prompt'])
         self.assertNotIn('tests/test_value.py', derive['files'])
 
-    def builder_body(self, inside=(), outside=()):
-        lines = lambda models: ''.join(f'\nBuilder-Model: {model}\n' for model in models)
-        claim = 'Sets the value to 1\n' + lines(inside)
-        body = f'Part of #7.\n\n## Claim\n\n{claim}\n## Work log\n\n- did it\n' + lines(outside)
-        return body, verify_receipt.claim_from(body)
+    def test_model_reads_exact_tracked_bytes_at_base_and_head(self):
+        attributes = 'stamp.txt export-subst\nfixture.txt export-ignore\n'
+        (self.repo / 'submodule').mkdir()
+        subprocess.run(['git', '-C', str(self.repo), 'update-index', '--add', '--cacheinfo',
+                        f'160000,{self.head},submodule'], check=True)
+        base_files = {'.gitattributes': attributes, 'stamp.txt': 'base $Format:%H$\n', 'fixture.txt': 'base fixture\n',
+                      'value.py': 'VALUE = 1\n', 'tests/test_value.py': VALUE_TEST}
+        self.base = self.commit('base attributes', base_files)
+        self.assertIn('160000 commit', subprocess.check_output(
+            ['git', '-C', str(self.repo), 'ls-tree', self.base, 'submodule'], text=True))
+        head_files = {
+            **base_files,
+            '.gitattributes': attributes + 'tests/test_value.py export-ignore\n',
+            'stamp.txt': 'head $Format:%H$\n', 'fixture.txt': 'head fixture\n',
+        }
+        self.head = self.commit('head attributes', head_files)
+        (self.repo / 'stamp.txt').write_text('working tree only\n')
+        (self.repo / 'untracked.txt').write_text('untracked\n')
+        code, last = self.check_snapshot(SHIM_RECORD_BYTES='1')
+        self.assertEqual(code, 0, last)
+        self.assertIn('CRITERIA PASS', last)
+        derive, link = [call for call in criteria_shim.calls(self.criteria_log) if call['tool'] == 'codex']
+        for side, call, expected in [('base', derive, base_files), ('head', link, head_files)]:
+            with self.subTest(side=side):
+                self.assertEqual({name: bytes.fromhex(content) for name, content in call['contents'].items()},
+                                 {name: content.encode() for name, content in expected.items()})
 
-    def check_builders(self, inside=(), outside=(), **env):
-        body, claim = self.builder_body(inside, outside)
-        return self.check(comments=[self.receipt_comment(claim=claim)], body=body, **env)
+    def test_an_escaping_symlink_makes_the_head_incomplete_before_the_model_reads_it(self):
+        (self.repo / 'outside-link').symlink_to('../outside.txt')
+        self.head = self.commit('head with escaping link', {})
+        code, last = self.check_snapshot()
+        self.assertEqual(code, 2, last)
+        self.assertEqual(last, "COLDVERIFY CRITERIA INCOMPLETE: acceptance criteria: "
+                               "unsafe tracked symlink in criteria snapshot: 'outside-link'")
+        (derive,) = [call for call in criteria_shim.calls(self.criteria_log) if call['tool'] == 'codex']
+        self.assertIn('Sets the value to 1', derive['prompt'])
 
     def assertNoModelCall(self):
-        self.assertEqual([call['tool'] for call in criteria_shim.calls(self.criteria_log)], [])
+        self.assertEqual(criteria_shim.calls(self.criteria_log), [])
 
     def routed_builders(self):
         return [call['args'][4:None:2] for call in criteria_shim.calls(self.criteria_log) if call['tool'] == 'cold']
 
-    def test_a_builder_model_line_inside_the_claim_names_the_builder(self):
-        done, last = self.check_builders(inside=[criteria_shim.BUILDER])
+    def test_pr_model_edits_keep_the_same_builder_and_claim(self):
+        original = f'Sets the value to 1\nBuilder-Model: {criteria_shim.BUILDER}'
+        receipt = self.receipt_comment(claim=original)
+        for body in (
+            f'## Claim\n{original}',
+            '## Claim\nSets the value to 1\n  builder-model: gpt-6.1-terra',
+            '## Claim\nSets the value to 1\n\n## Notes\nBuilder-Model: gpt-6.1-terra',
+            '## Claim\nSets the value to 1',
+        ):
+            with self.subTest(body=body):
+                code, last = self.check_snapshot(body=body, comments=[receipt])
+                self.assertEqual(code, 0, last)
+                self.assertEqual(last, 'COLDVERIFY CRITERIA PASS: 1 acceptance criteria, each covered by a proof test')
+        self.assertEqual(self.routed_builders(), [[criteria_shim.BUILDER]] * 4)
+        derives = [call['prompt'] for call in criteria_shim.calls(self.criteria_log)
+                   if call['tool'] == 'codex' and 'acceptance criteria for that claim' in call['prompt']]
+        self.assertEqual(len(derives), 4)
+        self.assertEqual(len(set(derives)), 1)
+        self.assertNotIn('Builder-Model:', derives[0])
+
+    def test_pr_declaration_and_links_to_other_prs_do_not_replace_a_missing_builder(self):
+        with contextlib.closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('DELETE FROM orchestration_v2_projection_threads')
+        self.link_builder('other-repo', criteria_shim.BUILDER, repository='other/r')
+        self.link_builder('other-pr', criteria_shim.BUILDER, number=8)
+        self.link_builder('other-host', criteria_shim.BUILDER, host='example.com')
+        done, last = self.check('--publish-check')
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn('no T3 builder model', last)
+        (run,) = self.published()
+        result = json.loads(run['output']['text'])
+        self.assertEqual((result['result'], result['builder_source'], result['criteria_verifier']),
+                         ('INCOMPLETE', None, None))
+        self.assertNoModelCall()
+
+    def test_a_link_with_no_run_model_leaves_the_builder_unverified(self):
+        self.link_builder('unknown')
+        code, last = self.check_snapshot()
+        self.assertEqual(code, 2, last)
+        self.assertIn('no T3 builder model', last)
+        self.assertNoModelCall()
+
+    def test_conflicting_linked_models_stop_before_routing(self):
+        self.link_builder('other', 'gpt-6.1-terra', repository='O/R')
+        code, last = self.check_snapshot()
+        self.assertEqual(code, 2, last)
+        self.assertIn('conflicting T3 builder models', last)
+        self.assertNoModelCall()
+
+    def test_agreeing_linked_models_route_once(self):
+        self.link_builder('other', criteria_shim.BUILDER.upper(), 'gpt-6.1-terra', number=8)
+        self.link_builder('also-builds', criteria_shim.BUILDER.upper(), other_number=8)
+        done, _ = self.check()
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(last, 'COLDVERIFY CRITERIA PASS: 1 acceptance criteria, each covered by a proof test')
         self.assertEqual(self.routed_builders(), [[criteria_shim.BUILDER]])
 
-    def test_a_builder_model_line_outside_the_claim_names_the_builder(self):
-        done, last = self.check_builders(outside=[criteria_shim.BUILDER])
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(self.routed_builders(), [[criteria_shim.BUILDER]])
-
-    def test_two_builder_model_lines_that_agree_name_one_builder(self):
-        done, last = self.check_builders(inside=[criteria_shim.BUILDER], outside=[criteria_shim.BUILDER])
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(self.routed_builders(), [[criteria_shim.BUILDER]])
-
-    def test_a_builder_model_line_the_runner_did_not_name_is_incomplete_before_any_model_call(self):
-        done, last = self.check_builders(inside=[criteria_shim.BUILDER], outside=['gpt-6-luna'])
+    def test_a_model_switch_on_a_linked_builder_thread_is_incomplete(self):
+        self.link_builder('switched', criteria_shim.BUILDER, 'gpt-6.1-terra')
+        done, last = self.check()
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertEqual(last, 'COLDVERIFY CRITERIA INCOMPLETE: the PR description\'s "Builder-Model:" lines name '
-                               f'{criteria_shim.BUILDER}, gpt-6-luna, but --builder-model names {criteria_shim.BUILDER}; '
-                               'they must agree before a criteria verifier is chosen')
+        self.assertIn('conflicting T3 builder models', last)
         self.assertNoModelCall()
 
-    def test_an_indented_builder_model_line_the_runner_did_not_name_is_incomplete_before_any_model_call(self):
-        body, claim = self.builder_body(inside=[criteria_shim.BUILDER])
-        body += '\n  Builder-Model: GPT-6.1-Terra\n'
-        done, last = self.check(comments=[self.receipt_comment(claim=claim)], body=body)
+    def test_an_unhashed_claim_in_the_receipt_cannot_match_a_new_pr_claim(self):
+        receipt = self.receipt_comment()
+        receipt['body'] = receipt['body'].replace('### Claim\n\nSets the value to 1',
+                                                   '### Claim\n\nSets the value to 2')
+        body = '## Claim\nSets the value to 2\nBuilder-Model: gpt-6.1-terra'
+        done, last = self.check(body=body, comments=[receipt])
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertIn('name claude-opus-5-5, gpt-6.1-terra, but --builder-model names claude-opus-5-5', last)
+        self.assertIn('no strict receipt from GitHub Actions', last)
         self.assertNoModelCall()
 
-    def test_a_wrong_builder_model_line_is_incomplete_before_any_model_call(self):
-        done, last = self.check_builders(inside=['gpt-6-luna'])
+    def test_a_changed_claim_is_incomplete_even_with_a_model_line_edit(self):
+        receipt = self.receipt_comment(claim=f'Sets the value to 1\nBuilder-Model: {criteria_shim.BUILDER}')
+        done, last = self.check(body='## Claim\nSets the value to 2\nBuilder-Model: gpt-6.1-terra',
+                                comments=[receipt])
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertIn('lines name gpt-6-luna, but --builder-model names claude-opus-5-5', last)
+        self.assertIn('no strict receipt from GitHub Actions', last)
         self.assertNoModelCall()
 
-    def test_an_omitted_builder_model_line_is_incomplete_before_any_model_call(self):
-        done, last = self.check_builders()
+    def test_unavailable_t3_database_is_incomplete(self):
+        self.state.unlink()
+        done, last = self.check()
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertIn('lines name no builder, but --builder-model names claude-opus-5-5', last)
+        self.assertIn('could not read T3 launch state', last)
+        self.assertFalse(self.state.exists())
         self.assertNoModelCall()
 
-    def test_a_builder_named_in_other_letter_case_is_never_chosen_as_the_verifier(self):
-        done, last = self.check_builders(inside=['GPT-6.1-Terra'], builders=['GPT-6.1-Terra'])
+    def test_unresolved_host_home_is_incomplete(self):
+        with mock.patch.object(Path, 'home', side_effect=RuntimeError('home unavailable')):
+            code, last = self.check_snapshot()
+        self.assertEqual(code, 2, last)
+        self.assertIn('could not read T3 launch state', last)
+        self.assertNoModelCall()
+
+    def test_manual_builder_cannot_override_the_protected_record(self):
+        done, last = self.check('--builder-model', 'gpt-6.1-terra')
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertIn('chose gpt-6.1-terra, which built the change', last)
-        self.assertEqual([call for call in criteria_shim.calls(self.criteria_log) if call['tool'] == 'codex'], [])
+        self.assertIn('--criteria-check resolves its builder from T3', last)
+        self.assertNoModelCall()
 
     def test_the_verifier_route_refuses_a_builder_named_in_other_letter_case(self):
         with mock.patch.dict(os.environ, self.env, clear=True):
             with self.assertRaisesRegex(verify_criteria.Unverified, 'chose gpt-6.1-terra, which built the change'):
                 verify_criteria.route(['GPT-6.1-Terra'])
 
-    def test_builder_model_lines_that_differ_only_in_letter_case_name_one_builder(self):
-        done, last = self.check_builders(inside=['Claude-Opus-5-5'], outside=[criteria_shim.BUILDER])
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual(self.routed_builders(), [[criteria_shim.BUILDER]])
-
-    def test_a_builder_model_line_alone_never_chooses_a_verifier(self):
-        done, last = self.check_builders(inside=[criteria_shim.BUILDER], builders=())
-        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertEqual(last, 'COLDVERIFY CRITERIA INCOMPLETE: no --builder-model given: a "Builder-Model:" line in the PR '
-                               'description is the author\'s own statement, so it cannot choose a criteria verifier '
-                               'independent of the builder (#122)')
-        self.assertNoModelCall()
-
-    def test_a_verifier_that_built_the_change_under_another_declared_name_is_never_chosen(self):
-        done, last = self.check_builders(inside=[criteria_shim.BUILDER], builders=['gpt-6.1-terra'])
-        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertIn('lines name claude-opus-5-5, but --builder-model names gpt-6.1-terra', last)
-        self.assertNoModelCall()
-
-    def test_a_builder_named_by_the_runner_is_never_chosen_as_the_verifier(self):
-        done, last = self.check_builders(inside=['gpt-6.1-terra'], builders=['gpt-6.1-terra'])
+    def test_the_router_cannot_choose_the_builder_recorded_by_t3(self):
+        with contextlib.closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('DELETE FROM orchestration_v2_projection_threads')
+            db.execute('DELETE FROM orchestration_v2_projection_runs')
+        self.link_builder('builder', 'GPT-6.1-Terra')
+        done, last = self.check()
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertEqual(last, 'COLDVERIFY CRITERIA INCOMPLETE: acceptance criteria: the model router chose '
                                'gpt-6.1-terra, which built the change')
+        self.assertEqual(self.routed_builders(), [['gpt-6.1-terra']])
         self.assertEqual([call for call in criteria_shim.calls(self.criteria_log) if call['tool'] == 'codex'], [])
 
     def test_a_verifier_sandbox_that_lets_a_file_outside_the_snapshot_be_read_is_never_asked(self):
@@ -287,11 +384,18 @@ class CriteriaCheck(unittest.TestCase):
         self.assertEqual(self.published(), [])
         self.assertEqual(criteria_shim.calls(self.criteria_log), [])
 
+    def test_checking_criteria_is_refused_inside_ci_even_without_publishing(self):
+        done, last = self.check(GITHUB_ACTIONS='true')
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn('--criteria-check is refused in CI', last)
+        self.assertFalse(self.log.exists())
+        self.assertNoModelCall()
+
     def test_publishing_is_refused_inside_a_coldbox_guest_without_github_actions(self):
         printed = io.StringIO()
         with mock.patch.dict(os.environ, self.env, clear=True), \
                 mock.patch.object(verify_context, 'coldbox_guest', return_value='runner-a'), contextlib.redirect_stdout(printed):
-            code = verify_receipt.criteria_check(self.repo, 7, [criteria_shim.BUILDER], publish=True)
+            code = verify_receipt.criteria_check(self.repo, 7, publish=True)
         self.assertEqual(code, 2)
         self.assertIn('--publish-check is refused in CI', printed.getvalue())
         self.assertEqual(self.published(), [])

@@ -151,6 +151,8 @@ if [ -f feature.txt ]; then echo "feature $(cat feature.txt)"; exit 0; fi
 echo "feature missing"
 exit 1
 '''
+ITEMS_FLOW = ROOT / 'tests/fixtures/api-persisted-items'
+ITEMS_API = ROOT / 'tests/fixtures/items_api.py'
 DEPLOYED_FLOW = '''#!/usr/bin/env python3
 import os, sys, urllib.error, urllib.request
 url = os.environ['COLD_DEPLOYED_TARGET'] + '/health'
@@ -230,9 +232,9 @@ class Receipt(unittest.TestCase):
                         'commit', '-q', '--allow-empty', '-m', message], check=True)
         return subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
 
-    def coldverify(self, *args, **env):
+    def coldverify(self, *args, builder=criteria_shim.BUILDER, **env):
         result = subprocess.run([sys.executable, str(self.tool / 'coldverify'), '--ci', *args,
-                                 '--builder-model', criteria_shim.BUILDER], cwd=self.repo,
+                                 *(['--builder-model', builder] if builder is not None else [])], cwd=self.repo,
                                 env={**self.env, **env}, text=True, capture_output=True)
         receipt_path = self.repo / '.cold/verify-receipt.json'
         self.assertTrue(receipt_path.is_file(), result.stdout + result.stderr)
@@ -584,8 +586,9 @@ class Receipt(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(receipt['result'], 'FAIL')
         self.assertIn('COLDVERIFY FAIL: repro tests did not fail on base and pass on head', result.stdout)
-        self.assertEqual(self.last_line(result), 'COLDVERIFY CI PASS: the receipt says FAIL; CI fails only for failing tests, flows that fail or could not run, '
-                                                 'or a bug fix without a working repro')
+        self.assertEqual(receipt['checks']['tests'], ['PASS', '3 tests ran fresh and passed'])
+        self.assertEqual(self.last_line(result), 'COLDVERIFY CI PASS: the receipt says FAIL. CI requires a passing test suite, '
+                                                 'passing declared flows, and repro evidence for bug fixes.')
 
     def test_a_merge_gate_run_fails_a_bug_fix_without_a_working_repro(self):
         evidence = {**self.repro_pass, 'result': 'FAIL', 'tests': [{'name': 't', 'base_exit': 0, 'head_exit': 0}]}
@@ -599,6 +602,21 @@ class Receipt(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(receipt['checks']['tests'][0], 'FAIL')
         self.assertEqual(self.last_line(result), 'COLDVERIFY CI FAIL: tests')
+
+    def test_a_merge_gate_run_requires_fresh_junit_evidence_of_a_test_that_ran(self):
+        for evidence, reason in (
+            (junit(0), 'the JUnit XML records no test that ran'),
+            ('<testsuite><testcase name="skipped"><skipped/></testcase></testsuite>',
+             'the JUnit XML records no test that ran'),
+            ('', '3 tests counted only from output text'),
+        ):
+            with self.subTest(evidence=evidence):
+                result, receipt = self.coldverify('--claim', 'Adds a value', FAKE_JUNIT=evidence, GITHUB_ACTIONS='true')
+                self.assertEqual(receipt['result'], 'INCOMPLETE')
+                self.assertEqual(receipt['checks']['tests'][0], 'INCOMPLETE')
+                self.assertIn(reason, receipt['checks']['tests'][1])
+                self.assertEqual(result.returncode, 1, self.last_line(result))
+                self.assertEqual(self.last_line(result), 'COLDVERIFY CI FAIL: tests')
 
     def test_an_opted_out_repro_is_incomplete(self):
         evidence = {**self.repro_pass, 'result': 'INCOMPLETE', 'tests': [], 'opt_out_reason': 'docs only'}
@@ -706,6 +724,17 @@ class Receipt(unittest.TestCase):
         self.assertEqual((create['token'], finish['token']), ('publisher-token', 'publisher-token'))
         self.assertIn('Coldverify-Receipt: https://github.com/o/r/runs/9', result.stdout)
         self.assertNotIn('receipt', receipt['checks'])
+
+    def test_a_long_claim_leaves_checks_and_repro_in_the_published_summary(self):
+        claim = 'Start of claim ' + 'x' * 80000 + ' end of claim'
+        result, receipt = self.coldverify('--publish-check', '--claim', claim, GITHUB_ACTIONS='true', GITHUB_REPOSITORY='o/r')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt['claim'], claim)
+        create, _ = self.published()
+        summary = create['run']['output']['summary']
+        for shown in ('Start of claim', 'end of claim', '### Checks', '### Repro', 'tests/test_value.py::Check.test_value'):
+            with self.subTest(shown=shown):
+                self.assertGreaterEqual(summary.find(shown), 0)
 
     def test_a_pull_request_receipt_is_published_on_the_pr_head_commit(self):
         event = self.repo.parent / 'event.json'
@@ -815,6 +844,96 @@ class Receipt(unittest.TestCase):
     def criteria_calls(self, tool):
         return [call for call in criteria_shim.calls(self.criteria_log) if call['tool'] == tool]
 
+    def standalone_adapter(self, reply=None):
+        self.env['PATH'] = str(self.repo.parent / 'bin') + ':/usr/bin:/bin'
+        self.env['FAKE_GH_BODY'] = ''
+        subprocess.run(['git', 'remote', 'remove', 'fixture'], cwd=self.repo, check=True)
+        for command in ('cold', 'codex'):
+            (self.repo.parent / 'bin' / command).unlink()
+        adapter = self.repo.parent / 'verifier'
+        real_sandbox = bool(os.environ.get('COLDVERIFY_TEST_REAL_BWRAP'))
+        adapter.write_text(f"""#!/usr/bin/python3
+import json
+import os
+import sys
+from pathlib import Path
+
+request = json.load(sys.stdin)
+properties = request['schema']['properties']
+assert request['prompt']
+assert request['model'] == 'independent'
+assert not Path('.git').exists()
+if {real_sandbox!r}:
+    assert not Path({str(self.repo)!r}).exists()
+    assert not Path('/etc').exists()
+    assert not os.access('.', os.W_OK)
+    assert 'HOME' not in os.environ
+if 'criteria' in properties:
+    assert not Path('tests/test_value.py').exists()
+    reply = {{'criteria': [{{'id': 'C1', 'text': 'the value is set'}}]}}
+else:
+    assert Path('tests/test_value.py').is_file()
+    reply = {{'links': [{{'id': 'C1', 'tests': ['tests/test_value.py::Check.test_value']}}]}}
+print(json.dumps(reply))
+""" if reply is None else '#!/bin/sh\nprintf "%s\\n" ' + repr(reply) + '\n')
+        adapter.chmod(0o755)
+        if not real_sandbox:
+            bwrap = self.repo.parent / 'bin' / 'bwrap'
+            bwrap.write_text("""#!/usr/bin/python3
+import os
+import sys
+
+args = sys.argv[1:]
+assert '--unshare-all' in args and '--share-net' not in args
+assert '--clearenv' in args and '--bind' not in args
+mounts = {args[i+2]: args[i+1] for i, arg in enumerate(args) if arg == '--ro-bind'}
+os.chdir(mounts['/snapshot'])
+os.execv(mounts['/verifier'], [mounts['/verifier']])
+""")
+            bwrap.chmod(0o755)
+        return ['--criteria-verifier', 'local', 'independent', 'default', str(adapter)]
+
+    def test_standalone_criteria_adapter_covers_the_claim_without_coldstack(self):
+        args = self.standalone_adapter()
+        result, receipt = self.coldverify('--claim', 'Sets the value', *args)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt['criteria_verifier'], {'provider': 'local', 'model': 'independent', 'effort': 'default'})
+        self.assertEqual(receipt['acceptance_criteria'], [
+            {'id': 'C1', 'text': 'the value is set', 'covered_by': ['tests/test_value.py::Check.test_value']}])
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            check, criteria, verifier = verify_criteria.check(
+                self.repo, 'Sets the value', self.repro_pass, [criteria_shim.BUILDER], verify_receipt.proved,
+                adapter=args[1:])
+        self.assertEqual(check, ('PASS', '1 acceptance criteria, each covered by a proof test'))
+        self.assertEqual((criteria, verifier), (receipt['acceptance_criteria'], receipt['criteria_verifier']))
+
+    def test_standalone_criteria_adapter_rejects_malformed_reply(self):
+        reply = '{"criteria": [{"id": "C1", "text": "the value is set", "extra": 1}]}'
+        result, receipt = self.coldverify('--claim', 'Sets the value', *self.standalone_adapter(reply))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('schema', receipt['checks']['criteria'][1])
+
+    def test_standalone_criteria_adapter_never_runs_without_builder_exclusion(self):
+        args = self.standalone_adapter()
+        result, receipt = self.coldverify('--claim', 'Sets the value', *args, builder=None)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('builder identity unverified', receipt['checks']['criteria'][1])
+        self.assertIsNone(receipt['criteria_verifier'])
+        args[2] = criteria_shim.BUILDER.upper()
+        result, receipt = self.coldverify('--claim', 'Sets the value', *args)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('built the change', receipt['checks']['criteria'][1])
+        self.assertIsNone(receipt['criteria_verifier'])
+
+    def test_standalone_criteria_adapter_never_runs_when_confinement_fails(self):
+        args = self.standalone_adapter()
+        bwrap = self.repo.parent / 'bin' / 'bwrap'
+        bwrap.write_text('#!/bin/sh\nexit 1\n')
+        bwrap.chmod(0o755)
+        result, receipt = self.coldverify('--claim', 'Sets the value', *args)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('sandbox', receipt['checks']['criteria'][1])
+
     def assertConfinedLikeItsProbe(self, call, probe):
         snapshot, outside = probe['args'][-2:]
         self.assertEqual(criteria_shim.filesystem(probe['args']), {
@@ -853,7 +972,8 @@ class Receipt(unittest.TestCase):
         self.assertEqual(link['files'], ['tests/test_value.py', 'value.py'])
 
     def test_a_proof_the_verifier_cannot_read_never_covers_a_criterion(self):
-        head = self.commit('hide the proof', {'.gitattributes': 'tests/test_value.py export-ignore\n'})
+        (self.repo / 'tests/test_value.py').unlink()
+        head = self.commit('remove the proof', {})
         evidence = json.dumps({**self.repro_pass, 'head': head})
         result, receipt = self.coldverify('--claim', 'Sets the value', FAKE_REPRO_EVIDENCE=evidence)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -873,7 +993,7 @@ class Receipt(unittest.TestCase):
         self.assertEqual(unnamed.returncode, 2, unnamed.stdout + unnamed.stderr)
         receipt = json.loads((self.repo / '.cold/verify-receipt.json').read_text())
         self.assertEqual(receipt['checks']['criteria'][0], 'INCOMPLETE')
-        self.assertIn('no --builder-model given', receipt['checks']['criteria'][1])
+        self.assertIn('builder identity unverified', receipt['checks']['criteria'][1])
         self.assertEqual((receipt['acceptance_criteria'], receipt['criteria_verifier']), ([], None))
 
     def pull_request_run(self, body, *builders):
@@ -906,8 +1026,7 @@ class Receipt(unittest.TestCase):
         done, receipt = self.pull_request_run('## Claim\nAdds a value\nBuilder-Model: claude-opus-5-5\n')
         self.assertEqual(receipt['result'], 'INCOMPLETE', done.stdout + done.stderr)
         self.assertEqual(receipt['checks']['criteria'], [
-            'INCOMPLETE', 'no --builder-model given: a "Builder-Model:" line in the PR description is the author\'s own '
-                          'statement, so it cannot choose a criteria verifier independent of the builder (#122)'])
+            'INCOMPLETE', 'builder identity unverified. No --builder-model given.'])
         self.assertEqual(self.criteria_calls('cold') + self.criteria_calls('codex'), [])
 
     def test_a_wrong_or_omitted_builder_model_line_never_chooses_a_verifier(self):
@@ -917,8 +1036,8 @@ class Receipt(unittest.TestCase):
                 done, receipt = self.pull_request_run(f'## Claim\nAdds a value\n{line}', criteria_shim.BUILDER)
                 self.assertEqual(receipt['result'], 'INCOMPLETE', done.stdout + done.stderr)
                 self.assertEqual(receipt['checks']['criteria'], [
-                    'INCOMPLETE', f'the PR description\'s "Builder-Model:" lines name {stated}, but --builder-model names '
-                                  f'{criteria_shim.BUILDER}; they must agree before a criteria verifier is chosen'])
+                    'INCOMPLETE', f'builder identity unverified. The PR description\'s "Builder-Model:" lines name {stated}. '
+                                  f'--builder-model names {criteria_shim.BUILDER}. They must agree before a criteria verifier is chosen.'])
                 self.assertEqual(self.criteria_calls('cold') + self.criteria_calls('codex'), [])
 
     def test_a_sign_off_never_routes_when_the_pr_builder_lines_disagree(self):
@@ -929,12 +1048,12 @@ class Receipt(unittest.TestCase):
                     check, signoff = verify_criteria.sign_off(self.repo, 'Adds a value', repro, [criteria_shim.BUILDER],
                                                               ['value.py'], declared)
                     self.assertEqual((check[0], signoff), ('INCOMPLETE', None))
-                    self.assertIn(f'"Builder-Model:" lines name {stated}, but --builder-model names', check[1])
+                    self.assertIn(f'"Builder-Model:" lines name {stated}. --builder-model names', check[1])
         self.assertEqual(self.criteria_calls('cold') + self.criteria_calls('codex'), [])
 
     def test_no_verifier_is_routed_without_a_builder_to_exclude(self):
         with mock.patch.dict(os.environ, {'PATH': self.env['PATH'], 'CRITERIA_LOG': str(self.criteria_log)}), \
-                self.assertRaisesRegex(verify_criteria.Unverified, '^no --builder-model given'):
+                self.assertRaisesRegex(verify_criteria.Unverified, '^builder identity unverified'):
             verify_criteria.route([])
         self.assertEqual(self.criteria_calls('cold'), [])
 
@@ -1127,6 +1246,60 @@ class Receipt(unittest.TestCase):
         self.assertIn('| `feature` | 1 | 0 | proof |', (self.repo / '.cold/verify-receipt.md').read_text())
         worktrees = subprocess.check_output(['git', '-C', str(self.repo), 'worktree', 'list'], text=True)
         self.assertEqual(len(worktrees.splitlines()), 1, worktrees)
+
+    def test_api_flow_proves_a_write_persisted_and_a_rejected_request_left_the_store_unchanged(self):
+        service = ITEMS_API.read_text()
+        self.repro_pass['base'] = self.commit('API acknowledges writes without saving them', {
+            'service.py': service.replace("            store.execute('INSERT INTO items VALUES (?)', (name,))",
+                                          '            pass'),
+        })
+        head = self.commit_flow('persist new items', ITEMS_FLOW.read_text(), {'service.py': service})
+        result, receipt = self.flows_run(head)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt['checks']['flows'], ['PASS', '1 flows passed on head, 1 of them failed on base'])
+        [flow] = receipt['flows']['flows']
+        self.assertEqual((flow['base_exit'], flow['head_exit'], flow['kind']), (1, 0, 'proof'))
+        for side, rows in (('base', '[]'), ('head', '["demo"]')):
+            output = flow[f'{side}_output']
+            self.assertEqual(output, (
+                'SQLite before POST: [] '
+                'POST /items {"name": "demo"} -> HTTP 201 created '
+                f'SQLite after create: {rows} '
+                'POST /items {"name": ""} -> HTTP 422 name required '
+                f'SQLite after error: {rows}'
+            ))
+            kept = f'.cold/flows/feature/{side}/output.txt'
+            self.assertIn(kept, [artifact['path'] for artifact in receipt['artifacts']])
+            self.assertEqual(' '.join((self.repo / kept).read_text().split()), output)
+
+    def test_api_flow_is_incomplete_when_sqlite_cannot_open_the_base_store(self):
+        service = ITEMS_API.read_text()
+        self.repro_pass['base'] = self.commit('store has no writable file path', {
+            'service.py': service.replace('def create_server(database):\n',
+                                          'def create_server(database):\n    database.mkdir()\n'),
+        })
+        head = self.commit_flow('provision the items store', ITEMS_FLOW.read_text(), {'service.py': service})
+        result, receipt = self.flows_run(head)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(receipt['checks']['flows'], [
+            'INCOMPLETE', 'flows could not run: feature (base exit 125: cannot provision: unable to open database file)',
+        ])
+        [flow] = receipt['flows']['flows']
+        self.assertEqual((flow['base_exit'], flow['head_exit'], flow['kind']), (125, 0, 'unrunnable'))
+
+    def test_api_flow_fails_when_the_head_handler_crashes_after_startup(self):
+        service = ITEMS_API.read_text()
+        self.repro_pass['base'] = self.commit('working items service', {'service.py': service})
+        head = self.commit_flow('handler crashes', ITEMS_FLOW.read_text(), {
+            'service.py': service.replace("        self.reply(201, b'created')",
+                                          "        raise RuntimeError('handler crashed')"),
+        })
+        result, receipt = self.flows_run(head)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(receipt['checks']['flows'], ['FAIL', 'flows failed on head: feature'])
+        [flow] = receipt['flows']['flows']
+        self.assertEqual((flow['base_exit'], flow['head_exit'], flow['kind']), (0, 1, 'regression'))
+        self.assertIn('RuntimeError: handler crashed', (self.repo / '.cold/flows/feature/head/output.txt').read_text())
 
     def test_a_flow_runs_against_the_checkout_it_sits_in_and_only_executables_are_flows(self):
         notes = self.repo / '.fleet/flows/README.md'
@@ -1825,6 +1998,23 @@ class UnsupportedTestRun(unittest.TestCase):
 
 
 class MixedReproReceipt(unittest.TestCase):
+    def test_markdown_keeps_sections_visible_after_multiline_evidence(self):
+        claim = 'Fix the value\n```\n<!-- Hide later sections'
+        document = {'result': 'INCOMPLETE', 'reason': 'Needs proof', 'commit': 'h', 'tree': 't',
+                    'claim': claim, 'checks': {'repro': ('INCOMPLETE', 'No proof\n| rerun required')},
+                    'run': None, 'verifier': {'version': '0.1.0', 'commit': None},
+                    'acceptance_criteria': [], 'risk': None,
+                    'environment': {'host': 'runner-a', 'isolation': 'local'},
+                    'repro': {**REPRO_PASS, 'tests': [
+                        {'name': 'test_value', 'base_exit': 1, 'head_exit': 0, 'kind': 'unproven'}]}}
+        rendered = verify_receipt.markdown(document)
+        self.assertIn('\n### Checks\n', rendered)
+        self.assertIn('| repro | INCOMPLETE | No proof \\| rerun required |', rendered)
+        self.assertIn('\n### Repro (at least one proof required)\n', rendered)
+        self.assertIn('| `test_value` | 1 | 0 | unproven |', rendered)
+        self.assertNotRegex(rendered, r'(?m)^\s*(?:```|<!-- Hide)')
+        self.assertEqual(document['claim'], claim)
+
     def test_pass_message_counts_only_proofs_including_legacy_evidence(self):
         evidence = {**REPRO_PASS, 'tests': [
             {'name': 'proof', 'base_exit': 1, 'head_exit': 0},

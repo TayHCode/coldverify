@@ -28,7 +28,7 @@ import verify_cache
 import verify_filter
 from verify_cache import head_sha, inputs_hash, recipe_contents, tree_sha
 from junit_unittest import JUNIT_KEY_ENV, SIGNATURE_SUFFIX, signature
-from verify_context import concurrent_run, host_name, lock, redact
+from verify_context import SuitePhase, concurrent_run, host_name, lock, redact
 
 SCHEMA_VERSION = 3
 HISTORY_PATH = Path('.cold/verify-history.jsonl')
@@ -216,11 +216,13 @@ def counted(steps, junit):
     return count, 'output' if count else None
 
 
-def verdict(code, steps, junit=None):
-    if code or any(step['status'] == 'fail' for step in steps):
+def verdict(code, steps, junit=None, infrastructure_phase=None):
+    if not infrastructure_phase and (code or any(step['status'] == 'fail' for step in steps)):
         return 'FAIL', f'exit {code}' if code else 'a step failed'
     if junit and (junit['failures'] or junit['errors']):
         return 'FAIL', f"the JUnit XML records {junit['failures']} failures and {junit['errors']} errors"
+    if infrastructure_phase:
+        return 'INCOMPLETE', f'infrastructure aborted during suite {infrastructure_phase}'
     skipped = [step['step'] for step in steps if step['status'] == 'skip']
     if skipped:
         return 'INCOMPLETE', 'not run fresh (skipped or cached): ' + ', '.join(skipped)
@@ -316,13 +318,16 @@ def run(command, root, env=None, gate=False, no_cache=False, ci=False, strict=Tr
                 signal.signal(number, signal.SIG_DFL if handler is None else handler)
         if received:
             sys.exit(128 + received[0])
-        setup, backend = (locked, locked), None
+        setup, backend, infrastructure_phase = (locked, locked), None, None
         if receipt.exists():
             exported = json.loads(receipt.read_text())
             ready_at = exported.pop('snapshot_ready_at', None)
             if ready_at is not None:
                 setup = (locked, max(locked, spawned + ready_at - spawned_at))
             backend = exported.pop('backend', None)
+            phase = exported.pop('infrastructure_phase', None)
+            if code == 2 and phase in (SuitePhase.SETUP, SuitePhase.EXECUTION):
+                infrastructure_phase = SuitePhase(phase)
             context.update(exported)
         finished = steps.finish(code)
         totals = junit_totals(junit, key)
@@ -336,16 +341,22 @@ def run(command, root, env=None, gate=False, no_cache=False, ci=False, strict=Tr
                     history.write(line)
     if ci:
         write_summary(rows, environ)
-    result, reason = verdict(code, finished, totals)
+    result, reason = verdict(code, finished, totals, infrastructure_phase)
     count, source = counted(finished, totals)
     summary = {'schema_version': RESULT_SCHEMA_VERSION, 'result': result, 'reason': reason, 'head': head, 'command': command, 'exit_code': code,
                'tests_ran': count, 'tests_source': source,
                'steps': [{key: row[key] for key in ('step', 'command', 'status', 'duration_ms')} for row in rows]}
+    if context.get('suite_head'):
+        summary.update(head=context['suite_head'], tree=context.get('suite_tree'))
     if isinstance(backend, str) and verify_backend.SPEC.fullmatch(backend):
         summary['backend'] = backend
+    if infrastructure_phase:
+        summary['infrastructure_phase'] = infrastructure_phase
     (root / RESULT_PATH).write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
     print(f'TESTS {result}: {reason}', flush=True)
-    return {'PASS': 0, 'INCOMPLETE': 2}.get(result, code or 1) if strict else code
+    if not strict:
+        return code
+    return {'PASS': 0, 'INCOMPLETE': 2, 'FAIL': 1 if infrastructure_phase else code or 1}[result]
 
 
 def main():

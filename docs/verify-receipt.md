@@ -70,31 +70,36 @@ verifier's original environment (for example `/proc/<pid>/environ`).
 On success the run prints `Coldverify-Receipt: <check run URL>`. Outside
 GitHub Actions, or when publishing fails, `checks.receipt` is `INCOMPLETE`.
 
-`coldverify --require-receipt` is the gate. It recomputes `HEAD^{tree}` and
-exits 0 (`COLDVERIFY RECEIPT PASS`) only when a `coldverify receipt` check run
-exists that:
+`coldverify --require-receipt` checks for a published PASS receipt for the
+current change. It looks up check runs on the current PR head and check runs
+the PR body attaches with a `Coldverify-Receipt: <check run URL or id>` line.
+To count, the check run and its receipt must meet all of these conditions.
 
-- was published by the `github-actions` app;
-- is completed with conclusion `success`;
-- has `external_id` equal to that tree;
-- carries the receipt JSON as its text, with a `builders` list equal to the
-  current `Builder-Model:` lines (lowercased, deduplicated, sorted) of the
-  branch's PR and of the PR the receipt names in `pull_request`, each re-read
-  with `gh pr view`, not taken from the event payload. Edit, remove or add a
-  line after the run, and the receipt no longer counts; rerun coldverify. A
-  receipt from before schema version 10 records no `builders`, and one too
-  large to keep its JSON in the check run has none to read; both are rejected by design (`FAIL`, "records no builders ...; rerun coldverify"): rerun coldverify to get a schema version 10 receipt.
-  When a PR's lines cannot be re-read, the gate is `INCOMPLETE`. A pre-PR
-  receipt on a branch with no PR has no lines to compare.
+- GitHub Actions published the `coldverify receipt` check run on the current
+  PR head, completed it with conclusion `success`, and set its
+  `external_id` to the Git tree of the checkout.
+- The checkout is the PR head or, in a pull request job, a merge commit
+  whose parents are the current PR base and head, in that order.
+- The receipt's `commit` and `tree` name the checkout. Its passing suite
+  records those same values in `run.head` and `run.tree`. Its repro
+  records the PR base and source head in `repro.base` and `repro.head`.
+- The receipt's claim hash matches the hash of the current `## Claim`
+  section. The receipt's `builders` match the current `Builder-Model:`
+  lines after lowercasing, deduplication, and sorting. Coldverify reads
+  those values and the current base and head from GitHub when it checks
+  the receipt.
 
-It looks at check runs on the PR head commit, and at every check run the PR
-body attaches with a line `Coldverify-Receipt: <check run URL or id>`. It
-matches by tree, not by ancestry. A pre-PR receipt from a commit with the same
-tree (an amend, a squash, a re-pushed branch) counts. A receipt for an
-ancestor, or for the head before the base moved under a merge checkout, does
-not. Otherwise it exits 1 (`COLDVERIFY RECEIPT FAIL`) and names each rejected
-check run with its reason. When it can't read the PR or the check runs, it
-exits 2 (`COLDVERIFY RECEIPT INCOMPLETE`).
+Before opening a PR, run `coldverify --require-receipt --claim 'Your claim'`
+with the checked-out head and the repro's default base, the merge base with
+`origin/main`. You can attach that check run to the PR once it exists.
+Put the attachment under a separate heading so the text of the claim stays
+the same. The receipt then needs to match the inputs of the PR. An amend
+invalidates a receipt even if it produces the same Git tree.
+
+Exit 0 means `PASS`. Exit 1 means `FAIL` and gives a reason for each
+rejected check run. Older receipts missing the suite tree need a fresh run.
+Exit 2 means `INCOMPLETE`, for example when GitHub cannot supply the PR
+details or check runs.
 
 Limit: the trusted source is the GitHub Actions app, not one workflow. Any
 Actions job in the repository with `checks: write`, including a workflow a
@@ -112,6 +117,8 @@ Coldverify has no app-specific drivers; the flow does the work and its exit
 code is the answer: 0 passed, 1 failed, anything else (including a timeout
 after 300 seconds) means it could not run. Subfolders of `.fleet/flows/` are
 for the flows' helpers, and other files there are not run.
+
+The [cart discount fixture](../examples/flows/browser-comparison/README.md) shows a browser flow with base and head screenshots.
 
 A strict run lists the flows at `repro.head`, checks out `repro.base` and
 `repro.head` in fresh worktrees, replaces the base checkout's `.fleet/flows/`
@@ -143,8 +150,43 @@ redacted, as `.cold/flows/<flow>/<side>/output.txt` and each regular file the fl
 `.cold/flows/<flow>/<side>/artifacts/<path>`. Text artifacts are redacted with the
 step-trace redactor; binary artifacts such as screenshots are kept as they
 are, so a flow must not write secrets into them. A
-flow red on base and green on head is the flow's proof of the change. Flows do
-not replace the repro: `checks.repro` still needs a proof test.
+flow that exits 1 on base and 0 on head with distinct output from each side
+can cover an acceptance criterion when a strict run has access to an
+independent verifier model.
+The independent verifier reads the flow and its helpers at the head revision
+and judges whether the assertions and observed outputs show the claimed
+behavior. The receipt lists the flow's `.fleet/flows/<name>` path in
+`covered_by`. If there were no new or changed test cases and every criterion
+has proof, a linked flow satisfies `checks.repro`. Test failures and
+infrastructure errors keep their verdicts.
+
+Coldbox CI guests have no model credential. They record the flow under
+`checks.flows` and keep the existing native repro requirement for bug fixes
+in the CI merge gate. The informational `--criteria-check` on the host
+currently receives test metadata from the PR receipt. A trusted handoff of
+flow observations is needed before that check can link a flow to a criterion.
+
+In a local Linux run, Coldverify starts a private user manager, session bus
+and journal for flows that name `systemctl`, `systemd-run` or `loginctl`
+in their executable. No repository setting is required. Call those commands
+in the flow file itself to request the runtime. The sandbox keeps the outer
+systemd and D-Bus sockets hidden.
+
+The private runtime needs cgroup v2, systemd, journald and `dbus-daemon`.
+On a regular Linux host, Coldverify requests a delegated scope from the
+runner's user manager via `/run/user/<uid>`. In a Coldbox guest it requests
+a transient service from the guest's system manager with the runner's UID
+and no new privileges. If Coldverify cannot start the private runtime,
+`checks.flows` is `INCOMPLETE`.
+
+Copy the executable [Coldpass archive example](../examples/flows/coldpass-archive-host)
+into a Coldpass checkout's `.fleet/flows/`. The flow loads the checked-out
+unit into the private manager and gives it a local archive destination and
+synthetic input. A fixture drop-in clears `ConditionHost` and directs
+`ExecStart` to the checked-out archive script. The flow saves the unit
+result and command output, then compares the reported source host with the
+guest hostname. A wrong source host or a failure in the archive script
+makes the flow exit 1. An unavailable manager or service setup makes it exit 125.
 
 An infrastructure flow brings up what it checks itself (a process, a container,
 or a Coldbox VM through `coldbox vm up`/`vm exec`), then checks a health
@@ -157,6 +199,13 @@ change that was never tested. `checks.flows` is then `INCOMPLETE`, naming each
 side that could not run with its exit code and last output line, unless some
 flow failed on head (exit 1), which makes it `FAIL` first. For example
 `flows could not run: health (base exit 125: no permission to start the service)`.
+
+The [items API example](../tests/fixtures/api-persisted-items) starts a
+loopback HTTP service from each revision and gives it a fresh SQLite database.
+It records the request, response and database rows after an accepted write
+and a rejected write. The [receipt tests](../tests/test_verify_receipt.py)
+exercise a base that returns `201` without saving the item, a head that saves
+it, and a base where SQLite cannot open the store.
 
 ## Deployed verification
 
@@ -294,13 +343,13 @@ Verdicts are `PASS`, `FAIL` or `INCOMPLETE`. A check is a two-item array:
 | `artifacts` | array | The evidence files this receipt was built from, under `.cold/`: `verify-repro.json`, `verify-result.json` and `verify-flows.json` when they exist, then every file under `.cold/flows/`. |
 | `artifacts[].path` | string | Path relative to the checkout. |
 | `artifacts[].sha256` | string | Lowercase hex SHA-256 of the file's bytes when the receipt was written. |
-| `acceptance_criteria` | array | What the claim requires, written by an independent verifier model that is given the claim and is started in a snapshot of the base code, never the diff, and each linked to the proof tests that check it. A codex permission profile lets it read only the snapshot, the codex executable and minimal system paths (no `/etc`), and before each model call a probe must show the snapshot readable and a file outside it not; otherwise the check is INCOMPLETE. The repository text it reads is untrusted; the prompts tell it so. Empty when none were derived; `checks.criteria` then says why. |
+| `acceptance_criteria` | array | What the claim requires. An independent verifier model derives the criteria from the claim and the exact tracked file bytes from the base commit. It links each criterion to proof tests or observed flows from a separate head snapshot. Git export attributes do not change the files in either criteria snapshot. The default route uses a Codex permission profile and probes confinement before each call. The standalone adapter uses a fresh Bubblewrap sandbox with a read-only snapshot and no network. Unavailable confinement leaves the check INCOMPLETE. The repository text it reads is untrusted; the prompts tell it so. Empty when none were derived; `checks.criteria` then says why. |
 | `acceptance_criteria[].id` | string | `C1`, `C2`, and so on. |
 | `acceptance_criteria[].text` | string | One observable behaviour that must hold after the change for the claim to be true. |
-| `acceptance_criteria[].covered_by` | array of strings | The `repro.tests[].name` of each proof test (kind `proof` or `missing-on-base`) whose assertions check this criterion, as judged by a second, fresh verifier call that sees the criteria and reads the proof tests in a read-only snapshot of the head. Empty when no proof covers it. |
+| `acceptance_criteria[].covered_by` | array of strings | The `repro.tests[].name` of each proof test (kind `proof` or `missing-on-base`) whose assertions check this criterion, or the path of a flow whose check and observed outputs cover the criterion. A fresh verifier call judges this from the criteria, flow observations and a read-only snapshot of the head. Empty when no proof covers it. |
 | `criteria_verifier` | object or null | The model that wrote and linked the criteria, or null when none was resolved. |
-| `criteria_verifier.provider` | string | Its provider. Only `codex` is run. |
-| `criteria_verifier.model` | string | The model ColdStack's model router chose for `auditor/verifier` with every `--builder-model` excluded. It is never a builder. |
+| `criteria_verifier.provider` | string | The provider selected by the ColdStack route or declared by the trusted standalone caller. |
+| `criteria_verifier.model` | string | The model selected by the ColdStack route or declared by the trusted standalone caller. Coldverify excludes every `--builder-model`. |
 | `criteria_verifier.effort` | string | Its reasoning effort. |
 | `suggestion` | object or null | The newest earlier `PASS` in the receipt archive for these paths (see [Archive](#archive)), or null when there is none, for a `--deployed` run, or when the archive could not be read. Never a check: it cannot change `result`. |
 | `suggestion.commit` | string | That run's commit. |
@@ -322,10 +371,10 @@ Verdicts are `PASS`, `FAIL` or `INCOMPLETE`. A check is a two-item array:
 | `risk.signoff.reason` | string | Its reason, in its own words. |
 | `checks` | object | One check per gate, in the order they ran. |
 | `checks.claim` | check | `PASS` when a claim was stated, else `INCOMPLETE`. |
-| `checks.repro` | check | Absent in a deployed run. The repro gate requires at least one 1/0 proof and no blocking transition. Acceptance (0/0) and unchanged non-zero tests never count as proof. `INCOMPLETE` with the error when the repro host is unreachable or drops the connection, staging or the transfer to it fails, or `git fetch` or `git worktree add` fails. |
+| `checks.repro` | check | Absent in a deployed run. The repro gate requires proof and no blocking transition. When the test gate found no new or changed cases, a criterion-linked observed flow can supply the proof. Acceptance (0/0) and unchanged non-zero tests never count as proof. `INCOMPLETE` with the error when the repro host is unreachable or drops the connection, staging or the transfer to it fails, or `git fetch` or `git worktree add` fails. |
 | `checks.tests` | check | Absent in a deployed run. The test run's verdict (`run.result`, `run.reason`; `PASS` with `reused from <check run URL>: ...` when the run was reused), or `INCOMPLETE` when the tests did not run or `verify-result.json` has an unknown version. |
 | `checks.tamper` | check | Absent in a deployed run. Test weakening and evidence tampering, compared with the merge base of `repro.base` and `repro.head`. `INCOMPLETE` when a test file is deleted or moved out of the test paths; a Python test case is deleted; a `skip`, `skipif`, `skipIf`, `skipUnless`, `skipTest`, `SkipTest`, `xfail`, `expectedFailure`, `xit`, `xdescribe` or `xtest` marker appears on a line of a test file or `conftest.py` that base didn't have, or is added to a pre-existing Python test case; an assertion (`assert`, or a call named `assert*`, `fail*` or `raises`) of a pre-existing Python test case, including methods of any top-level `Test*` class, is removed, changed, or moved under different control flow, or the case gains a `return`, `break` or `continue`; a file under `.fleet/flows/` is edited, deleted or renamed (`flow changed; needs review: PATH`; adding one is fine); a `.fleet/verify.*` file is added or edited, or deleted while another stays (`recipe changed; needs review: PATH`), or has uncommitted changes; the PR's `## Claim` section, re-read live with `gh pr view` after the run, differs from `claim`, or its `Builder-Model:` lines differ from those the run started with; or any of these comparisons fails. Otherwise `PASS`. |
-| `checks.criteria` | check | Absent in a deployed run. In a Coldbox guest always `INCOMPLETE` (`acceptance criteria are checked by the separate "coldverify criteria" check on the PR head, run on a trusted host; no model credential in the CI guest by design`), without calling `cold` or `codex`. `PASS` when the verifier derived at least one acceptance criterion and every one is covered by a proof test. `INCOMPLETE` when a criterion has no proof test (`acceptance criteria no proof test covers: C2 (...)`); when there is no claim, no builder (no `--builder-model`: a `Builder-Model:` line in the PR description alone never chooses a verifier, #122), PR `Builder-Model:` lines (anywhere in the description, `## Claim` included) that do not name the same models as `--builder-model` (a missing line too) when the run has a PR, a failed PR lookup (the lines cannot be compared; the high-risk sign-off makes the same comparison), or no repro base and head; or when `cold`, `codex` or the verifier's answer fails (in a Coldbox guest a missing tool says `no model credential in the CI guest by design`) (missing tool, non-zero exit, timeout, malformed or incomplete JSON, a criterion over 500 characters, a link to a test that is not a proof, or a chosen model that is a builder). |
+| `checks.criteria` | check | Absent in a deployed run. In a Coldbox guest always `INCOMPLETE` (`acceptance criteria are checked by the separate "coldverify criteria" check on the PR head, run on a trusted host; no model credential in the CI guest by design`), without calling `cold` or `codex`. `PASS` when the verifier derived at least one acceptance criterion and every one is covered by a proof test or observed flow. `INCOMPLETE` when a criterion has no proof (`acceptance criteria no proof test covers: C2 (...)`); when there is no claim, no builder (no `--builder-model`: a `Builder-Model:` line in the PR description alone never chooses a verifier, #122), PR `Builder-Model:` lines (anywhere in the description, `## Claim` included) that do not name the same models as `--builder-model` (a missing line too) when the run has a PR, a failed PR lookup (the lines cannot be compared; the high-risk sign-off makes the same comparison), or no repro base and head; when a tracked path cannot be safely materialized in a criteria snapshot (the reason names the path); or when `cold`, `codex` or the verifier's answer fails (in a Coldbox guest a missing tool says `no model credential in the CI guest by design`) (missing tool, non-zero exit, timeout, malformed or incomplete JSON, a criterion over 500 characters, a link to a test that is not a proof, or a chosen model that is a builder). |
 | `checks.risk` | check | Present for a `high` change or when the tier could not be told; absent for `normal`. `PASS` only when the independent verifier signed off (`high risk (PATHS): MODEL signed off: REASON`). `INCOMPLETE`, never `PASS`, when it did not sign off; when another check has not passed, so no sign-off is sought; when there is no repro base and head, `.fleet/risk.json` at base is invalid, or Git fails; when the diff (taken with `--text`, so `-diff` attributes can't hide content) is over 200,000 characters, or a matched file that exists at head is missing from the head snapshot (`export-ignore`); or when `cold`, `codex` or the answer fails as for `checks.criteria`. |
 | `checks.flows` | check | Present only when the checkout's `HEAD`, `repro.head` or `repro.base` (whichever are available locally) declares flows. `FAIL` when a flow exits 1 on head (`flows failed on head: NAME`). Otherwise `INCOMPLETE` when a flow exits anything but 0 or 1 on either side, or the flows were not run (a local repro ran on another host: `flows run only on the repro host: ...`; the repro ran on an `ssh:` backend: `flows do not run on an ssh: backend: ...`; the repro's container or Coldbox backend could not start or return a flow's result: `flows: the ... backend gave no answer: ...`; a flow on base is missing from head (`flows on base missing from head (rebase onto base): NAME`), no repro base and head, `git fetch` or `git worktree add` failed). Otherwise `PASS` (`N flows passed on head, K of them failed on base`). In a deployed run it is always present: `FAIL` when a flow exits 1 against the target (`flows failed against TARGET: NAME`), `INCOMPLETE` when one exits anything else or no flow reads `COLD_DEPLOYED_TARGET`, otherwise `PASS` (`N flows passed against TARGET`, then the flows not run because they do not read it). |
 | `checks.receipt` | check | `INCOMPLETE` while a PR exists and its post is not confirmed. It is saved before posting (`posting the receipt to PR #N was not confirmed`), so a run killed mid-post never leaves `PASS`, and kept when posting fails (`the receipt could not be posted to PR #N`). With `--publish-check` it is also saved as `INCOMPLETE` before publishing (`publishing the receipt as a check run was not confirmed`), and kept when publishing fails (`the receipt was not published as a check run: REASON`, including outside GitHub Actions). Absent once every post and publish succeeds, or when there is no PR and no `--publish-check`. |
@@ -334,11 +383,11 @@ Verdicts are `PASS`, `FAIL` or `INCOMPLETE`. A check is a two-item array:
 | `repro.tests` | array | One entry per reproduced test. |
 | `repro.tests[].name` | string | `<path>::<Class>.<method>` or `<path>::<function>`. |
 | `repro.tests[].base_exit` | integer | The test's exit on the base commit. Proof requires 1 (assertion failure), or 3 for `missing-on-base`. |
-| `repro.tests[].kind` | string | `proof`, `missing-on-base`, `acceptance`, `unchanged`, `regression`, or `unproven`; absent in older receipts. Only a 1/0 test that runs a changed non-test line on head counts as `proof`; a 1/0 test that doesn't is `unproven`. A strict-run test that errors on base only because an import or attribute names a function, class, variable or module the head adds to non-test code, in that same importable module (package path up to the first folder without `__init__.py`, so namespace packages are not matched; a renamed module counts as new) or class (or a base class), has base exit 3; with a head pass that runs a changed line it is `missing-on-base` and counts as proof. |
+| `repro.tests[].kind` | string | `proof`, `missing-on-base`, `acceptance`, `unchanged`, `regression`, or `unproven`. A strict native Python 1/0 replay is `unproven` pending runner-observed changed-line evidence. An import or attribute on base that names a function, class, variable or module added on head in that same importable module or class can record base exit 3. A 3/0 Python replay is also `unproven`. Older receipts can record such a proof as `missing-on-base` or omit `kind`. |
 | `repro.tests[].head_exit` | integer | The test's exit on the head commit. Proof requires 0 (passed). |
 | `repro.tests[].base_output` | string | The case's stdout and stderr on base, redacted with the step-trace redactor (private keys, JWTs, `token`/`secret`/`password`/`api_key` assignments, authorization headers, URL credentials, GitHub/AWS/Slack/OpenAI tokens, and secret-named environment values) and cut to one line of at most 1000 characters, head and tail kept. Only the first and last MiB of output are held, in memory. Absent in evidence from an older coldverify. |
 | `repro.tests[].head_output` | string | The same excerpt for the head run. |
-| `repro.tests[].commands` | array of strings | The exact base and head commands the gate ran for this case, shell-quoted: that side's Python, the verifier's `verify_repro.py --case`, and on head the change-tracing arguments. Absent in evidence from an older coldverify. |
+| `repro.tests[].commands` | array of strings | The exact base and head commands the gate ran for this case, shell-quoted. Native Python runs that side's Python and the verifier's `verify_repro.py --case` with the test file and name. Absent in evidence from an older coldverify. |
 | `repro.base` | string or null | Base commit SHA. For a PR merge checkout, this is its authenticated first parent. A stale event base must be its ancestor, and it must belong to the fetched `origin/<GITHUB_BASE_REF>` history. Full checkouts use that local ref without network access. |
 | `repro.head` | string or null | Exact PR head commit SHA, including when the checkout is a merge whose second parent must match it. |
 | `repro.host` | string | Host that ran the repro. |
@@ -370,11 +419,13 @@ Verdicts are `PASS`, `FAIL` or `INCOMPLETE`. A check is a two-item array:
 | `run.result` | verdict | The test run's verdict. |
 | `run.reason` | string | Why, such as `3 tests ran fresh and passed` or `exit 7`. |
 | `run.head` | string or null | `HEAD` when the tests ran, or null outside Git. |
+| `run.tree` | string or null | Git tree of the worktree the suite used. Absent or null when Coldverify could not bind the worktree to a committed tree. |
 | `run.command` | array of strings | The test command coldverify ran: `bash <install>/ci/fleet-verify.sh`, which runs the repo's recipe, possibly behind a low-priority wrapper. |
-| `run.exit_code` | integer | The recipe's exit code. |
+| `run.exit_code` | integer | The suite launcher's exit code. |
+| `run.infrastructure_phase` | `setup` or `execution` | Present when the suite launcher reports an infrastructure abort. The required suite gate fails. The test check records `INCOMPLETE`, or `FAIL` if signed JUnit records a failure or error. |
 | `run.tests_ran` | integer | Tests that ran and were not skipped. |
 | `run.tests_source` | `junit`, `output` or null | Where the count came from. `output` means it was counted from printed text, not JUnit XML, and is never enough to pass. |
-| `run.backend` | string | Where the suite ran, as `environment.backend` spells it, recorded by the Linux or macOS lane once that backend returned a verdict (or, run here, just before the recipe starts). Absent when no backend gave a verdict, or in results from an older coldverify. |
+| `run.backend` | string | Where the suite ran, as `environment.backend` spells it. The Linux or macOS lane records it when there is evidence of where the suite started or finished. Older Coldverify versions may omit it. |
 | `run.steps` | array | One entry per recipe step, in order. |
 | `run.steps[].step` | string | Step name (a `::group::` title, or `verify`). |
 | `run.steps[].command` | string | The step's command. |
@@ -388,6 +439,9 @@ Verdicts are `PASS`, `FAIL` or `INCOMPLETE`. A check is a two-item array:
 prefix. Its schema is `$defs/result` in the same schema file.
 
 ## Example
+
+This receipt shows an earlier verifier that accepted Python hit reports. Current
+strict native Python replays record these exits as `unproven`.
 
 ```json
 {

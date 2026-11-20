@@ -41,6 +41,11 @@ class MergeGateExit(unittest.TestCase):
     def test_tests_that_did_not_run_fail(self):
         self.assertEqual(exit_code(receipt(run=False, tests=('INCOMPLETE', 'the tests did not run')), False)[0], 1)
 
+    def test_a_recorded_incomplete_suite_fails(self):
+        run = receipt(tests=('INCOMPLETE', 'the JUnit XML records no test that ran'))
+        run['run'] = {'result': 'INCOMPLETE'}
+        self.assertEqual(exit_code(run, False), (1, 'COLDVERIFY CI FAIL: tests\n'))
+
     def test_failing_flows_fail(self):
         self.assertEqual(exit_code(receipt('FAIL', flows=('FAIL', 'flows failed on head: health')), False)[0], 1)
 

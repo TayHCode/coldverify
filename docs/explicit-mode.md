@@ -28,11 +28,20 @@ that also holds `--base`, an ancestor of `--head`.
 3. Exit 1 on base and 0 on head is a proof. A head exit of 1, or a base exit of 0, fails. Any other exit, or a
    timeout, is INCOMPLETE.
 4. The result is the receipt's `repro`, as one test named `test command`. `.cold/verify-receipt.json` is the usual
-   receipt. No repository suite runs, so `checks.tests` is INCOMPLETE, and so is a good run's `result`. Callers read
-   `checks.repro` for the before/after verdict and treat `result: FAIL` as a failure.
+   receipt. By default the repository suite is absent, so `checks.tests` and a successful repro's overall
+   `result` are INCOMPLETE. Read `checks.repro` for the before and after verdict.
+
+Pass `--suite-command COMMAND` to run the repository suite at `--head`. Coldverify installs dependencies again
+in a fresh worktree and runs the suite there with the same sandbox and time limit as the repro.
+Use the existing signed test adapters, for example
+`--suite-command 'python3 "$COLD_VERIFY_UNITTEST" discover'`. For pytest, run `"$COLD_VERIFY_PYTEST"` with the
+Python that has pytest installed. A suite PASS requires a positive test count from signed JUnit. The receipt
+records the suite's commit in `run.head` and its tree in `run.tree`. A revision mismatch leaves the suite and
+receipt INCOMPLETE.
 
 The command is untrusted input. It runs only in a Coldbox guest, or where the operator set `COLD_VERIFY_BACKEND=local`
 (normally inside a disposable VM). Anywhere else the repro is INCOMPLETE and the command never runs.
 
-Exit codes: 0 PASS, 1 FAIL, 2 INCOMPLETE or a usage error. A usage error, including a checkout whose `HEAD` is not
-`--head`, prints to stderr and writes no receipt.
+Exit codes are 0 for PASS, 1 for FAIL, and 2 for INCOMPLETE or a usage error. A usage error prints to stderr
+and writes no receipt. A checkout whose `HEAD` differs from `--head` is a usage error when `--suite-command`
+is absent.

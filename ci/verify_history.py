@@ -81,9 +81,9 @@ def suggest(root, repro, flows=None):
     return None
 
 
-def described(suggestion):
-    return (f"the last PASS for these paths, `{suggestion['commit']}`, proved it with "
-            + ', '.join(f"{proof['strategy']} `{proof['name']}`" for proof in suggestion['proofs']))
+def described(suggestion, code=lambda value: f'`{value}`'):
+    return (f"the last PASS for these paths, {code(suggestion['commit'])}, proved it with "
+            + ', '.join(f"{proof['strategy']} {code(proof['name'])}" for proof in suggestion['proofs']))
 
 
 def announce(root):

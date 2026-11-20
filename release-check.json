@@ -19,7 +19,7 @@
   "quickstart": [
     {
       "file": "README.md",
-      "line": 13,
+      "line": 17,
       "argv": [
         "python3",
         "coldverify",
@@ -28,7 +28,7 @@
     },
     {
       "file": "README.md",
-      "line": 29,
+      "line": 33,
       "argv": [
         "python3",
         "-m",
@@ -39,7 +39,7 @@
     },
     {
       "file": "README.md",
-      "line": 66,
+      "line": 113,
       "argv": [
         "python3",
         "-m",
@@ -347,6 +347,306 @@
       "source_sha256": "6321ae031d13c4903cfaa1dbd2129c6f16396532bbadd116bccdd36cf48a68e9",
       "line": 18,
       "reason": "Python decorator text, not an address."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "ci/linux-verify.py",
+      "line": 297,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ca61d1c3d94c979bb6f43e2a770327138fe5cd983a86708ca591c8321e756fc6",
+      "classification": "false-positive",
+      "reason": "GitHub Actions runner home used for a guest cache check."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_criteria.py",
+      "line": 305,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "f3dabd18d7310d79ce0886ef14b7b3a3c623ef214df4f2dd55a9d21b75bc428d",
+      "classification": "false-positive",
+      "reason": "Delimiter between a proof test path and name."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_flow_systemd.py",
+      "line": 48,
+      "fingerprint": "d0609c4cf79f05d8",
+      "source_sha256": "f96d25b00d70a89a936780c558a09c2e062f7ef281bcf561b153cc3160076810",
+      "classification": "false-positive",
+      "reason": "Linux cgroup v2 membership record prefix."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_flow_systemd.py",
+      "line": 76,
+      "fingerprint": "d0609c4cf79f05d8",
+      "source_sha256": "f96d25b00d70a89a936780c558a09c2e062f7ef281bcf561b153cc3160076810",
+      "classification": "false-positive",
+      "reason": "Linux cgroup v2 membership record prefix."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_receipt.py",
+      "line": 1018,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "c0ca09887745fbb0afaf6a8633317a846c1142a520826155cc316eae7ddda098",
+      "classification": "false-positive",
+      "reason": "Delimiter between a proof test path and name."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_repro.py",
+      "line": 689,
+      "fingerprint": "bac182c2a7d2a65e",
+      "source_sha256": "2d44470f601a1273b70fd55dadf63fa5621bf8755a166f764eb80f1e9b5def4c",
+      "classification": "false-positive",
+      "reason": "Python slice syntax that pairs text with line endings."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "ci/verify_repro.py",
+      "line": 689,
+      "fingerprint": "a7e2023a4d4bdd47",
+      "source_sha256": "2d44470f601a1273b70fd55dadf63fa5621bf8755a166f764eb80f1e9b5def4c",
+      "classification": "false-positive",
+      "reason": "Python slice syntax that pairs text with line endings."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "tests/criteria_shim.py",
+      "line": 33,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "e138e98292db56b2b2268967816c59fdcfdef1599def0492b81ed6faeeb3b603",
+      "classification": "false-positive",
+      "reason": "Synthetic proof test delimiter."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "tests/test_criteria_check.py",
+      "line": 376,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "2c5fbabb86d25c033c45ebf34f390c7f80367df8f77e678678f52d80504904ed",
+      "classification": "false-positive",
+      "reason": "Synthetic proof test delimiter."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 48,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 50,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 217,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 218,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 220,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv4",
+      "path": "tests/test_verify_fastlane.py",
+      "line": 344,
+      "fingerprint": "37fcff24bf62035b",
+      "source_sha256": "761ce8a76fabf8dc3752bb20b99a428759404785cc36a43477957d5ba764c89e",
+      "classification": "false-positive",
+      "reason": "Documentation address from TEST-NET-1 used as synthetic private data in the test."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "ci/linux-verify.py",
+      "line": 297,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ca61d1c3d94c979bb6f43e2a770327138fe5cd983a86708ca591c8321e756fc6",
+      "classification": "false-positive",
+      "reason": "GitHub Actions runner home used for a guest cache check."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_criteria.py",
+      "line": 305,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "f3dabd18d7310d79ce0886ef14b7b3a3c623ef214df4f2dd55a9d21b75bc428d",
+      "classification": "false-positive",
+      "reason": "Delimiter between a proof test path and name."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_flow_systemd.py",
+      "line": 48,
+      "fingerprint": "d0609c4cf79f05d8",
+      "source_sha256": "f96d25b00d70a89a936780c558a09c2e062f7ef281bcf561b153cc3160076810",
+      "classification": "false-positive",
+      "reason": "Linux cgroup v2 membership record prefix."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_flow_systemd.py",
+      "line": 76,
+      "fingerprint": "d0609c4cf79f05d8",
+      "source_sha256": "f96d25b00d70a89a936780c558a09c2e062f7ef281bcf561b153cc3160076810",
+      "classification": "false-positive",
+      "reason": "Linux cgroup v2 membership record prefix."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_receipt.py",
+      "line": 1018,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "c0ca09887745fbb0afaf6a8633317a846c1142a520826155cc316eae7ddda098",
+      "classification": "false-positive",
+      "reason": "Delimiter between a proof test path and name."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_repro.py",
+      "line": 689,
+      "fingerprint": "bac182c2a7d2a65e",
+      "source_sha256": "2d44470f601a1273b70fd55dadf63fa5621bf8755a166f764eb80f1e9b5def4c",
+      "classification": "false-positive",
+      "reason": "Python slice syntax that pairs text with line endings."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "ci/verify_repro.py",
+      "line": 689,
+      "fingerprint": "a7e2023a4d4bdd47",
+      "source_sha256": "2d44470f601a1273b70fd55dadf63fa5621bf8755a166f764eb80f1e9b5def4c",
+      "classification": "false-positive",
+      "reason": "Python slice syntax that pairs text with line endings."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "tests/criteria_shim.py",
+      "line": 33,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "e138e98292db56b2b2268967816c59fdcfdef1599def0492b81ed6faeeb3b603",
+      "classification": "false-positive",
+      "reason": "Synthetic proof test delimiter."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "tests/test_criteria_check.py",
+      "line": 376,
+      "fingerprint": "71546855d6279ef7",
+      "source_sha256": "2c5fbabb86d25c033c45ebf34f390c7f80367df8f77e678678f52d80504904ed",
+      "classification": "false-positive",
+      "reason": "Synthetic proof test delimiter."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 48,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 50,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 217,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 218,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_npm_content_cache.py",
+      "line": 220,
+      "fingerprint": "b1cbc5f347543a03",
+      "source_sha256": "ce21a641eb7175404468e96ced1972b906a1a01a821a823f4f43dadb92d1606f",
+      "classification": "false-positive",
+      "reason": "Synthetic GitHub Actions runner home used by the cache fixtures."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv4",
+      "path": "tests/test_verify_fastlane.py",
+      "line": 344,
+      "fingerprint": "37fcff24bf62035b",
+      "source_sha256": "761ce8a76fabf8dc3752bb20b99a428759404785cc36a43477957d5ba764c89e",
+      "classification": "false-positive",
+      "reason": "Documentation address from TEST-NET-1 used as synthetic private data in the test."
     }
   ]
 }

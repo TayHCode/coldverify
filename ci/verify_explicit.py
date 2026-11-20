@@ -2,6 +2,7 @@
 import json
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import verify_receipt
 import verify_repro
 import verify_trace
 from verify_context import coldbox_guest, host_name
+from verify_repro import sandbox
 
 NAME = 'test command'
 CODES = {'proof': 0, 'unproven': 2}
@@ -61,39 +63,15 @@ def checked_out(root, commit, checkout):
     return checkout
 
 
-def sandbox(root, writable, network):
-    bwrap = shutil.which('bwrap')
-    if bwrap is None:
-        raise verify_repro.NoRepro('bubblewrap (bwrap) is not installed, and the test command never runs unsandboxed')
-    root = Path(root).resolve()
-    common = Path(verify_repro.git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip())
-    hidden = ['/run', '/tmp', '/var', '/home', '/root', '/srv', '/mnt', '/media', str(root)]
-    command = [bwrap, '--die-with-parent', '--new-session', '--unshare-all', *(['--share-net'] if network else []),
-               '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc']
-    for path in hidden:
-        command += ['--tmpfs', path]
-    resolver = os.path.realpath('/etc/resolv.conf')
-    command += ['--ro-bind-try', resolver, resolver, '--ro-bind', str(common), str(common)]
-    for path in writable:
-        command += ['--bind', str(path), str(path)]
-    for path in reversed(hidden):
-        command += ['--remount-ro', path]
-    return command + ['--']
-
-
-def sandboxed(root, writable, network, command, checkout, env, output):
-    marker = Path(env['HOME']) / '.cold-sandbox-started'
-    marker.unlink(missing_ok=True)
-    prefix = sandbox(root, writable, network)
+def sandboxed(root, writable, network, command, checkout, env, output, readable=(), log=None):
+    prefix = sandbox(root, writable, network, readable)
     started = time.monotonic()
-    try:
-        code = verify_repro.run_test([*prefix, 'sh', '-c', ': > "$0" && exec sh -c "$1"', str(marker), command],
-                                     checkout, env, capture=output)
-    except OSError as error:
-        raise verify_repro.NoRepro('the sandbox could not start: ' + verify_repro.excerpt(error)) from error
-    if not marker.is_file():
-        raise verify_repro.NoRepro(f'the sandbox did not start (exit {code}): {output[0]}')
+    code = verify_repro.run_sandboxed(prefix, ['/bin/sh', '-c', command], checkout, env, capture=output, output=log)
     timed_out = code == 2 and time.monotonic() - started >= verify_repro.CASE_TIMEOUT
+    if log is not None:
+        log.seek(0)
+        output.append(verify_repro.excerpt(log.read(4096).decode(errors='replace')))
+        log.seek(0)
     return code, timed_out
 
 
@@ -140,16 +118,79 @@ def compare(root, base, head, command, folder, setup=None):
             'commands': [base_command, head_command], 'offline': bool(offline)}
 
 
-def run(root, base, head, command, setup=None):
+def check_suite_tree(root, checkout, home, env, revision, untracked):
+    command = (f'test "$(git --no-replace-objects rev-parse HEAD)" = {shlex.quote(revision)}'
+               f' && changes=$(git -c core.fsmonitor=false status --porcelain --untracked-files={untracked})'
+               ' && test -z "$changes"')
+    code, _ = sandboxed(root, (checkout, home), False, command, checkout, env, [])
+    if code:
+        raise verify_repro.NoRepro(f'the suite worktree does not match the requested revision {revision}')
+
+
+def run_suite(root, head, command, folder, setup):
+    result = {'schema_version': verify_trace.RESULT_SCHEMA_VERSION, 'result': 'INCOMPLETE',
+              'head': None, 'tree': None, 'backend': 'local', 'command': ['sh', '-c', command],
+              'exit_code': 2, 'tests_ran': 0, 'tests_source': None, 'steps': []}
+    try:
+        checkout = checked_out(root, head, folder / 'suite')
+        try:
+            home, junit, adapters = (folder / name for name in ('suite-home', 'junit', 'adapters'))
+            for path in (home, junit, adapters):
+                path.mkdir()
+            env = verify_repro.case_environment(home)
+            revision, tree = verify_repro.git(checkout, '--no-replace-objects', 'rev-parse', 'HEAD', 'HEAD^{tree}').decode().splitlines()
+            expected = verify_repro.git(root, '--no-replace-objects', 'rev-parse', f'{head}^{{tree}}').decode().strip()
+            if (revision, tree) != (head, expected):
+                raise verify_repro.NoRepro(f'the suite worktree does not match the requested revision {head}')
+            if setup:
+                install(root, 'suite', setup, checkout, home, env)
+                check_suite_tree(root, checkout, home, env, head, 'all')
+            result.update(head=revision, tree=tree)
+            key = secrets.token_hex(32)
+            env.update({verify_trace.JUNIT_ENV: str(junit), verify_trace.JUNIT_KEY_ENV: key})
+            for name in ('unittest', 'pytest'):
+                adapter = adapters / f'junit_{name}.py'
+                shutil.copyfile(Path(__file__).with_name(adapter.name), adapter)
+                env[f'COLD_VERIFY_{name.upper()}'] = str(adapter)
+            output = []
+            steps = verify_trace.Steps(command)
+            with tempfile.TemporaryFile() as log:
+                code, timed_out = sandboxed(root, (checkout, home, junit), False, command, checkout, env, output, (adapters,), log)
+                for line in log:
+                    steps.feed(line.decode(errors='replace'))
+            finished = steps.finish(code)
+            if any(path.is_symlink() or not path.is_file() for path in junit.iterdir()):
+                raise verify_repro.NoRepro('the suite did not produce regular JUnit evidence files')
+            totals = verify_trace.junit_totals(junit, key)
+            count, source = verify_trace.counted(finished, totals)
+            status, reason = ('INCOMPLETE', 'the suite timed out') if timed_out else verify_trace.verdict(code, finished, totals)
+            if status == 'PASS':
+                check_suite_tree(root, checkout, home, verify_repro.case_environment(home), head, 'no')
+            rows = verify_trace.records(finished, revision, {}, None)
+            result.update(result=status, reason=reason, exit_code=code, tests_ran=count, tests_source=source,
+                          steps=[{name: row[name] for name in ('step', 'command', 'status', 'duration_ms')} for row in rows])
+        finally:
+            verify_repro.git(root, 'worktree', 'remove', '--force', str(checkout))
+    except (verify_repro.NoRepro, OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        result.update(result='INCOMPLETE', reason=verify_repro.excerpt(error))
+    return result
+
+
+def run(root, base, head, command, setup=None, suite=None):
     root = Path(root)
     report = {'result': 'INCOMPLETE', 'tests': [], 'base': None, 'head': None, 'host': host_name(),
               'platform': platform.system().lower(), 'backend': 'local', 'opt_out_reason': None}
+    suite_result = None
     try:
+        if suite is not None and verify_receipt.revision(root, 'HEAD') != head:
+            raise verify_repro.NoRepro(f'the checkout does not match the requested suite revision {head}')
         check_inputs(root, base, head)
         report.update(base=base, head=head)
         placement()
         with tempfile.TemporaryDirectory(prefix='cold-explicit-', dir=os.environ.get('RUNNER_TEMP') or None) as folder:
             test = compare(root, base, head, command, Path(folder), setup)
+            if suite is not None:
+                suite_result = run_suite(root, head, suite, Path(folder), setup)
         offline = test.pop('offline')
         report['tests'] = [test]
         report['result'] = {'proof': 'PASS', 'unproven': 'INCOMPLETE'}.get(test['kind'], 'FAIL')
@@ -165,6 +206,8 @@ def run(root, base, head, command, setup=None):
         print('INCOMPLETE: ' + report['error'], flush=True)
     for forged in (verify_trace.RESULT_PATH, verify_flows.EVIDENCE):
         (root / forged).unlink(missing_ok=True)
+    if suite_result is not None:
+        (root / verify_trace.RESULT_PATH).write_text(json.dumps(suite_result, indent=2) + '\n', encoding='utf-8')
     shutil.rmtree(root / verify_flows.ARTIFACTS, ignore_errors=True)
     (root / verify_receipt.REPRO_PATH).write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     return CODES.get(report['tests'][0]['kind'], 1) if report['tests'] else 2

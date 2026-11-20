@@ -1,5 +1,6 @@
 import ast
 from collections import Counter
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -8,10 +9,11 @@ import platform
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 
-from verify_context import SECRET_NAME, coldbox_guest
+from verify_context import SECRET_NAME, coldbox_guest, redact
 import evidence_export
 import verify_backend
 import verify_cache
@@ -37,6 +39,7 @@ RECEIPT_CHECK = 'coldverify receipt'
 TRUSTED_APP = 'github-actions'
 ATTACHED = re.compile(r'^Coldverify-Receipt:[ \t]*(?:https://\S+/runs/)?(\d+)[ \t\r]*$', re.MULTILINE)
 CHECK_TEXT_LIMIT = 65535
+CLAIM_DISPLAY_LIMIT = 8000
 CRITERIA_CHECK = 'coldverify criteria'
 RECEIPT_AUTHOR = 'github-actions[bot]'
 REPRO_BLOCK = '<!-- coldverify repro: '
@@ -45,9 +48,7 @@ REPRO_BLOCK_LIMIT = 20000
 MAX_PROOFS = 200
 MAX_PROOF_NAME = 300
 INFORMATIONAL = ('Informational only: nothing may require or gate on this check until a publisher that other workflows '
-                 'cannot imitate exists. Builder named by whoever ran this check (--builder-model), '
-                 'and the PR\'s "Builder-Model:" lines must agree with it; until a builder record the PR author cannot '
-                 'write exists, the verifier is independent of the builder only if that runner is.')
+                 'cannot imitate exists. The host resolves the builder from a T3 pull request link.')
 FLEET_VERIFY = Path(__file__).with_name('fleet-verify.sh')
 SCHEMA = Path(__file__).with_name('verify-receipt.schema.json')
 
@@ -66,26 +67,6 @@ def builders_from(body):
 
 def builder_set(models):
     return sorted({model.lower() for model in models})
-
-
-def builder_change(root, run, pull):
-    try:
-        receipt = json.loads(run['output']['text'])
-    except (KeyError, TypeError, ValueError):
-        receipt = None
-    recorded = receipt.get('builders') if isinstance(receipt, dict) else None
-    if not (isinstance(recorded, list) and all(isinstance(model, str) for model in recorded)):
-        return 'records no builders it was issued for (a receipt from before #123, or one too large to keep its JSON); rerun coldverify'
-    issued = receipt.get('pull_request')
-    numbers = [pull[0]] if pull else []
-    if type(issued) is int and issued not in numbers:
-        numbers.append(issued)
-    for number in numbers:
-        current = builder_set(builders_from(pr_body(root, number)))
-        if current != recorded:
-            return (f'issued for builders {", ".join(recorded) or "none"}, but the "Builder-Model:" lines of PR #{number} now name '
-                    f'{", ".join(current) or "none"}; rerun coldverify on the current description')
-    return None
 
 
 def pr_body(root, number):
@@ -424,7 +405,7 @@ def reuse(root, wanted, pull):
     if error or risk['tier'] != 'normal' or not all(wanted.values()):
         return None
     try:
-        runs = published_runs(root, revision(root, 'HEAD'), pull)
+        runs = published_runs(root, head_commit(root, revision(root, 'HEAD')), pull[1] if pull else '')
     except (GitHubError, KeyError, TypeError):
         return None
     for run in runs:
@@ -481,6 +462,21 @@ def private_repository():
     return isinstance(event, dict) and (event.get('repository') or {}).get('private') is True
 
 
+def markdown_field(value, *, code=False, limit=None):
+    text = ' '.join(redact(str(value)).split())
+    if limit is not None and len(text) > limit:
+        half = limit // 2
+        text = text[:half] + ' … ' + text[-half:]
+    if code and text and not any(char in text for char in '`|'):
+        return f'`{text}`'
+    text = re.sub(r'[\\`*_\[\]<>#&|~]', lambda match: '\\' + match[0], text)
+    return re.sub(r'^(\d*)([-+=.)])', r'\1\\\2', text)
+
+
+def markdown_code(value):
+    return markdown_field(value, code=True)
+
+
 def risk_line(risk):
     if not risk:
         return 'Risk: unknown'
@@ -488,14 +484,24 @@ def risk_line(risk):
     signoff = risk['signoff']
     if signoff:
         line += f"; {signoff['model']} {'signed off' if signoff['approved'] else 'did not sign off'}: {signoff['reason']}"
-    return line
+    return markdown_field(line)
 
 
 def suggestion_line(suggestion):
     if not suggestion:
         return 'Suggestion: none (no earlier PASS in the receipt archive changed these paths)'
-    return (f"Suggestion: {verify_history.described(suggestion)}; {'used' if suggestion['used'] else 'not used'} here. "
+    return (f"Suggestion: {verify_history.described(suggestion, markdown_code)}; {'used' if suggestion['used'] else 'not used'} here. "
             'A suggestion never changes the verdict.')
+
+
+def check_rows(checks):
+    return [f'| {markdown_field(name)} | {markdown_field(result)} | {markdown_field(reason)} |'
+            for name, (result, reason) in checks.items()]
+
+
+def criterion_rows(criteria):
+    return [f"| {markdown_field(criterion['id'])}: {markdown_field(criterion['text'])} | "
+            f"{', '.join(map(markdown_code, criterion['covered_by'])) or '**no proof test**'} |" for criterion in criteria]
 
 
 def deployed_markdown(receipt):
@@ -503,59 +509,61 @@ def deployed_markdown(receipt):
     reached = (f"Target contact: {contact['established_by']} ({contact['probe']}); "
                f"flow contact with the target is {contact['flow_contact']}" if contact else
                'Target contact: not established, so no flow ran against the target')
-    lines = [f"## coldverify {receipt['result']} against `{receipt['deployed']}`", '', receipt['reason'], '', reached, '',
-             f"Commit: `{receipt['commit']}`" + (' (its flows ran against the deployed target)' if receipt['flows']['flows'] else ''), '',
-             f"Verifier: coldverify {receipt['verifier']['version']} ({receipt['verifier']['commit'] or 'unknown commit'}) "
-             f"on {receipt['environment']['host']}", '', '### Claim', '', receipt['claim'] or '_none stated_', '',
+    lines = [f"## coldverify {receipt['result']} against {markdown_code(receipt['deployed'])}", '',
+             markdown_field(receipt['reason']), '', markdown_field(reached), '',
+             f"Commit: {markdown_code(receipt['commit'])}" + (' (its flows ran against the deployed target)' if receipt['flows']['flows'] else ''), '',
+             markdown_field(f"Verifier: coldverify {receipt['verifier']['version']} ({receipt['verifier']['commit'] or 'unknown commit'}) "
+                            f"on {receipt['environment']['host']}"), '', '### Claim', '',
+             markdown_field(receipt['claim'] or '', limit=CLAIM_DISPLAY_LIMIT) or '_none stated_', '',
              '### Checks', '', '| check | result | why |', '| --- | --- | --- |']
-    lines += [f'| {name} | {result} | {reason.replace("|", "/")} |' for name, (result, reason) in receipt['checks'].items()]
+    lines += check_rows(receipt['checks'])
     lines += ['', '### Flows', '', '| flow | exit | kind |', '| --- | ---: | --- |']
-    lines += [f"| `{flow['name']}` | {flow['head_exit']} | {flow['kind']} |" for flow in receipt['flows']['flows']]
+    lines += [f"| {markdown_code(flow['name'])} | {flow['head_exit']} | {flow['kind']} |" for flow in receipt['flows']['flows']]
     return '\n'.join(lines) + '\n'
 
 
 def markdown(receipt):
     if receipt.get('deployed'):
         return deployed_markdown(receipt)
-    lines = [f"## coldverify {receipt['result']}", '', receipt['reason'], '',
-             f"Commit: `{receipt['commit']}`", '', f"Tree: `{receipt['tree']}`", '',
-             f"Verifier: coldverify {receipt['verifier']['version']} ({receipt['verifier']['commit'] or 'unknown commit'}) "
-             f"on {receipt['environment']['host']} ({receipt['environment']['isolation']})", '', risk_line(receipt['risk']), '',
-             suggestion_line(receipt.get('suggestion')), '', '### Claim', '', receipt['claim'] or '_none stated_', '',
+    lines = [f"## coldverify {receipt['result']}", '', markdown_field(receipt['reason']), '',
+             f"Commit: {markdown_code(receipt['commit'])}", '', f"Tree: {markdown_code(receipt['tree'])}", '',
+             markdown_field(f"Verifier: coldverify {receipt['verifier']['version']} ({receipt['verifier']['commit'] or 'unknown commit'}) "
+                            f"on {receipt['environment']['host']} ({receipt['environment']['isolation']})"), '', risk_line(receipt['risk']), '',
+             suggestion_line(receipt.get('suggestion')), '', '### Claim', '',
+             markdown_field(receipt['claim'] or '', limit=CLAIM_DISPLAY_LIMIT) or '_none stated_', '',
              '### Acceptance criteria', '']
     if receipt['acceptance_criteria']:
         lines += ['| criterion | covered by |', '| --- | --- |']
-        lines += [f"| {criterion['id']}: {criterion['text'].replace('|', '/')} | "
-                  f"{', '.join(f'`{test}`' for test in criterion['covered_by']) or '**no proof test**'} |"
-                  for criterion in receipt['acceptance_criteria']]
+        lines += criterion_rows(receipt['acceptance_criteria'])
     else:
         lines.append('None derived.')
     lines += ['', '### Checks', '', '| check | result | why |', '| --- | --- | --- |']
-    lines += [f'| {name} | {result} | {reason.replace("|", "/")} |' for name, (result, reason) in receipt['checks'].items()]
+    lines += check_rows(receipt['checks'])
     repro = receipt['repro'] or {}
     lines += ['', '### Repro (at least one proof required)', '']
     if repro.get('tests'):
-        lines += [f"Base `{repro.get('base')}`, head `{repro.get('head')}` on {repro.get('host')}", '',
+        lines += [f"Base {markdown_code(repro.get('base'))}, head {markdown_code(repro.get('head'))} on {markdown_field(repro.get('host'))}", '',
                   '| test | base exit | head exit | kind |', '| --- | ---: | ---: | --- |']
-        lines += [f"| `{test['name']}` | {test['base_exit']} | {test['head_exit']} | {test.get('kind', 'unclassified')} |" for test in repro['tests']]
+        lines += [f"| {markdown_code(test['name'])} | {test['base_exit']} | {test['head_exit']} | {markdown_field(test.get('kind', 'unclassified'))} |"
+                  for test in repro['tests']]
     else:
         lines.append('No repro test ran.')
     run = receipt['run']
     lines += ['', '### Test run', '']
     if run:
         source = {'junit': 'from JUnit XML', 'output': 'unbound: counted from output text, not JUnit XML'}.get(run.get('tests_source'))
-        lines += [f"Command: `{' '.join(run['command'])}`, exit {run['exit_code']}, tests ran: {run['tests_ran']}"
+        lines += [f"Command: {markdown_code(' '.join(run['command']))}, exit {run['exit_code']}, tests ran: {run['tests_ran']}"
                   + (f' ({source})' if source else ''), '',
                   '| step | status | seconds | command |', '| --- | --- | ---: | --- |']
-        lines += [f"| {step['step'].replace('|', '/')} | {step['status']} | {step['duration_ms'] / 1000:.1f} | `{step['command']}` |"
+        lines += [f"| {markdown_field(step['step'])} | {step['status']} | {step['duration_ms'] / 1000:.1f} | {markdown_code(step['command'])} |"
                   for step in run['steps']]
     else:
         lines.append('The tests did not run.')
     flows = receipt.get('flows')
     if flows:
-        lines += ['', '### Flows', '', f"Base `{flows['base']}`, head `{flows['head']}` on {flows['host']}", '',
+        lines += ['', '### Flows', '', f"Base {markdown_code(flows['base'])}, head {markdown_code(flows['head'])} on {markdown_field(flows['host'])}", '',
                   '| flow | base exit | head exit | kind |', '| --- | ---: | ---: | --- |']
-        lines += [f"| `{flow['name']}` | {flow['base_exit']} | {flow['head_exit']} | {flow['kind']} |" for flow in flows['flows']]
+        lines += [f"| {markdown_code(flow['name'])} | {flow['base_exit']} | {flow['head_exit']} | {flow['kind']} |" for flow in flows['flows']]
     return '\n'.join(lines) + '\n' + repro_block(receipt)
 
 
@@ -565,7 +573,9 @@ def claim_digest(claim):
 
 def repro_block(receipt):
     repro = receipt['repro'] or {}
-    data = {'claim': claim_digest(receipt['claim'] or ''), 'base': repro.get('base'), 'head': repro.get('head'),
+    claim = receipt['claim'] or ''
+    data = {'claim': claim_digest(claim), 'criteria_claim': claim_digest(criteria_claim(claim)),
+            'base': repro.get('base'), 'head': repro.get('head'),
             'tests': [{key: test[key] for key in ('name', 'base_exit', 'head_exit', 'kind') if key in test}
                       for test in repro.get('tests') or []]}
     block = json.dumps(data, separators=(',', ':')).replace('>', '\\u003e')
@@ -665,60 +675,155 @@ def distrust(run, tree):
     return None
 
 
-def published_runs(root, checkout, pull):
-    runs = github(root, f'commits/{head_commit(root, checkout)}/check-runs', '--method', 'GET', '--paginate',
+def published_runs(root, head, body):
+    runs = github(root, f'commits/{head}/check-runs', '--method', 'GET', '--paginate',
                   '--jq', '.check_runs[]', '-f', f'check_name={RECEIPT_CHECK}', '-f', 'per_page=100', lines=True)
-    return runs + [github(root, f'check-runs/{number}') for number in ATTACHED.findall(pull[1] if pull else '')]
+    return runs + [github(root, f'check-runs/{number}') for number in dict.fromkeys(ATTACHED.findall(body))]
 
 
-def require(root):
+def live_pull(root, number=None):
+    selector = [str(number)] if number is not None else []
+    env = verify_repro.clean_environment()
+    if repository := env.get('GITHUB_REPOSITORY'):
+        env['GH_REPO'] = repository
+    try:
+        query = subprocess.run(['gh', 'pr', 'view', *selector, '--json', 'number,body,baseRefOid,headRefOid'],
+                               cwd=root, text=True, capture_output=True, env=env, check=False)
+    except FileNotFoundError:
+        raise GitHubError('gh is not installed') from None
+    if query.returncode:
+        if number is None and any(message in query.stderr.lower() for message in NO_PULL_REQUEST):
+            return None
+        raise GitHubError(verify_repro.excerpt(query.stderr) or f'gh exited {query.returncode}')
+    try:
+        pull = json.loads(query.stdout)
+        if (type(pull['number']) is not int or pull['number'] <= 0 or (number is not None and pull['number'] != number)
+                or not isinstance(pull['body'], str)
+                or not all(isinstance(pull[key], str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', pull[key])
+                           for key in ('baseRefOid', 'headRefOid'))):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise GitHubError('gh pr view returned no PR body or commit identity') from None
+    return pull
+
+
+def receipt_mismatch(root, receipt, check, checkout, tree, pull, claim):
+    if pull:
+        head, base = pull['headRefOid'], pull['baseRefOid']
+        claim = claim_from(pull['body'])
+        builders, recorded = builder_set(builders_from(pull['body'])), receipt['builders']
+        if builders != recorded:
+            return (f'issued for builders {", ".join(recorded) or "none"}, but the "Builder-Model:" lines of PR '
+                    f'#{pull["number"]} now name {", ".join(builders) or "none"}; rerun coldverify on the current description')
+        if checkout != head and (not verify_repro.pr_event_applies(root)
+                                 or verify_repro.commit_parents(root, checkout) != [base, head]):
+            return 'checkout is neither the current PR head nor its merge with the current base'
+    else:
+        head, base = checkout, verify_repro.default_base(root)
+        claim = (claim or '').strip()
+    if not claim:
+        raise GitHubError('no current claim: add a "## Claim" section to the PR description or pass --claim before opening a PR')
+    if check.get('head_sha') != head:
+        return 'check run does not name the current PR head'
+    issued = receipt.get('pull_request')
+    if issued is not None and (type(issued) is not int or pull is None or issued != pull['number']):
+        return 'receipt names a different PR'
+    if (receipt.get('result'), receipt.get('commit'), receipt.get('tree')) != ('PASS', checkout, tree):
+        return 'receipt verdict, checkout commit or tree differs'
+    repro, suite = receipt.get('repro'), receipt.get('run')
+    if not isinstance(repro, dict) or (repro.get('base'), repro.get('head')) != (base, head):
+        return 'repro base or head differs from the current inputs'
+    if not isinstance(suite, dict) or (suite.get('result'), suite.get('head'), suite.get('tree')) != ('PASS', checkout, tree):
+        return 'suite commit or tree differs from the current checkout'
+    recorded_claim = receipt.get('claim')
+    if not isinstance(recorded_claim, str) or claim_digest(recorded_claim) != claim_digest(claim):
+        return 'receipt claim differs from the current claim'
+    return None
+
+
+def require(root, claim=None):
     root = Path(root)
     tree, checkout = revision(root, 'HEAD^{tree}'), revision(root, 'HEAD')
     if not tree or not checkout:
         return 'INCOMPLETE', 'could not read the commit and tree of HEAD'
     try:
-        pull = pull_request(root)
-    except PullRequestUnknown as error:
-        return 'INCOMPLETE', f'could not read the PR for attached receipts: {error}'
+        event = pull_request(root) if verify_repro.pr_event_applies(root) and os.environ.get('GITHUB_EVENT_PATH') else None
+        pull = live_pull(root, event[0] if event else None)
+    except (GitHubError, PullRequestUnknown, OSError, ValueError, KeyError, TypeError) as error:
+        return 'INCOMPLETE', f'could not read the current PR inputs: {error}'
     try:
-        runs = published_runs(root, checkout, pull)
+        runs = published_runs(root, pull['headRefOid'] if pull else checkout, pull['body'] if pull else '')
     except (GitHubError, KeyError, TypeError) as error:
         return 'INCOMPLETE', 'could not read the receipts: ' + (str(error) if isinstance(error, GitHubError) else 'unexpected reply')
-    rejected, unread = [], []
-    for run in runs:
+    rejected, unread, issued_pulls = [], [], {}
+    for check in runs:
+        url = check.get('html_url')
+        problem = distrust(check, tree)
+        if problem:
+            rejected.append(f'{url}: {problem}')
+            continue
         try:
-            problem = distrust(run, tree) or builder_change(root, run, pull)
-        except GitHubError as error:
-            unread.append(f"could not re-read the PR's Builder-Model lines for {run.get('html_url')}: {error}")
+            receipt = json.loads(check['output']['text'])
+        except (KeyError, TypeError, ValueError):
+            receipt = None
+        builders = receipt.get('builders') if isinstance(receipt, dict) else None
+        if not isinstance(builders, list) or not all(isinstance(model, str) for model in builders):
+            rejected.append(f'{url}: records no builders it was issued for (a receipt from before #123, '
+                            'or one too large to keep its JSON); rerun coldverify')
+            continue
+        try:
+            current = pull
+            issued = receipt.get('pull_request')
+            if current is None and type(issued) is int:
+                if issued not in issued_pulls:
+                    try:
+                        issued_pulls[issued] = live_pull(root, issued)
+                    except GitHubError as error:
+                        issued_pulls[issued] = error
+                current = issued_pulls[issued]
+                if isinstance(current, GitHubError):
+                    raise current
+            problem = receipt_mismatch(root, receipt, check, checkout, tree, current, claim)
+        except (GitHubError, verify_repro.NoRepro, subprocess.CalledProcessError) as error:
+            unread.append(f'could not read the current PR inputs for {url}: {error}')
             continue
         if not problem:
-            return 'PASS', f"{run.get('html_url')} is a PASS receipt from GitHub Actions for tree {tree}"
-        rejected.append(f"{run.get('html_url')}: {problem}")
+            return 'PASS', f'{url} is a PASS receipt from GitHub Actions for tree {tree}'
+        rejected.append(f'{url}: {problem}')
     if unread:
         return 'INCOMPLETE', '; '.join(unread)
     return 'FAIL', f'no PASS receipt from GitHub Actions for tree {tree}' + ('; rejected ' + '; '.join(rejected) if rejected else '')
 
 
 def finish(root, claim, pull, repro_code, command, verifier, pull_error=None, builders=(), publish_check=False,
-           claim_source='coldverify --claim', hashes=None, deployed=None, declared=None):
+           claim_source='coldverify --claim', hashes=None, deployed=None, declared=None, suite_revision=None, flows=None,
+           repro=None, criteria_adapter=None):
     root = Path(root)
+    if repro is None:
+        repro = read(root / REPRO_PATH)
     checks = {'claim': ('PASS', 'claim stated') if claim else
               ('INCOMPLETE', 'no claim: add a "## Claim" section to the PR description or pass --claim')}
     if not deployed:
-        checks['repro'] = repro_check(repro_code, read(root / REPRO_PATH))
+        checks['repro'] = repro_check(repro_code, repro)
     if pull_error:
         checks['receipt'] = ('INCOMPLETE', f'could not tell whether this branch has a PR, so no receipt was posted: {pull_error}')
     run = None if deployed else read(root / verify_trace.RESULT_PATH)
+    if suite_revision:
+        commit = revision(root, 'HEAD')
+        tree = revision(root, f'{commit}^{{tree}}') if commit else None
+        if run and run.get('result') == 'PASS' and (commit != suite_revision or not tree
+                or (run.get('head'), run.get('tree')) != (commit, tree)):
+            run.update(result='INCOMPLETE', reason=f'suite evidence does not match the requested revision {suite_revision}')
+    else:
+        commit = tree = None
     if run and run.get('schema_version') != verify_trace.RESULT_SCHEMA_VERSION:
         checks['tests'] = ('INCOMPLETE', f"{verify_trace.RESULT_PATH} has schema_version {run.get('schema_version')!r}; "
                                          f'this coldverify reads only {verify_trace.RESULT_SCHEMA_VERSION}')
         run = None
     elif not deployed:
         checks['tests'] = (run['result'], run['reason']) if run else ('INCOMPLETE', 'the tests did not run')
-    flows = read(root / verify_flows.EVIDENCE)
     if flows:
         checks['flows'] = (flows['result'], flows['reason'])
-    repro = read(root / REPRO_PATH)
     criteria, criteria_verifier, risk, suggestion = [], None, None, None
     if not deployed:
         checks['tamper'] = tamper_check(root, repro, claim, pull)
@@ -726,8 +831,14 @@ def finish(root, claim, pull, repro_code, command, verifier, pull_error=None, bu
             checks['criteria'] = ('INCOMPLETE', 'no criteria verifier chosen: the PR\'s "Builder-Model:" lines could not be read '
                                                 f'to compare with --builder-model: {pull_error}')
         else:
+            observations = verify_flows.proof_observations(flows, repro)
             checks['criteria'], criteria, criteria_verifier = verify_criteria.check(root, claim, repro, list(builders), proved,
-                                                                                    declared)
+                                                                                    declared, flows=observations,
+                                                                                    adapter=criteria_adapter)
+            if (observations and checks['criteria'][0] == 'PASS' and repro_code == 2
+                    and repro.get('error') == verify_repro.NO_TEST_CASES
+                    and any(name in observations for criterion in criteria for name in criterion['covered_by'])):
+                checks['repro'] = ('PASS', 'observed flows reproduced the claim on base and passed on head')
         risk_result, risk = risk_check(root, claim, repro, list(builders), checks, declared)
         if risk_result:
             checks['risk'] = risk_result
@@ -736,8 +847,9 @@ def finish(root, claim, pull, repro_code, command, verifier, pull_error=None, bu
         except (OSError, subprocess.CalledProcessError) as error:
             print(f'coldverify: the receipt archive was not searched for a suggestion: {verify_repro.excerpt(error)}',
                   file=sys.stderr, flush=True)
-    receipt = settle({'schema_version': SCHEMA_VERSION, 'claim': claim, 'commit': revision(root, 'HEAD'),
-                      'tree': revision(root, 'HEAD^{tree}'),
+    receipt = settle({'schema_version': SCHEMA_VERSION, 'claim': claim,
+                      'commit': commit if suite_revision else revision(root, 'HEAD'),
+                      'tree': tree if suite_revision else revision(root, 'HEAD^{tree}'),
                       'fingerprint': hashes or fingerprint(root, {'backend': 'local'} if deployed else repro, verifier),
                       'pull_request': pull[0] if pull else None,
                       'builders': builder_set(builders if declared is None else declared),
@@ -781,27 +893,34 @@ BUG_FIX_HELP = ('This PR is marked as a fix; add a test that fails without your 
 
 
 def ci_exit(receipt, bug_fix):
-    """Exit code of a strict --ci run: 1 only for a real break, so a change with no proof still merges and its receipt says so."""
+    """Require a passing suite, passing declared flows, and repro evidence for bug fixes."""
     checks = receipt['checks']
-    broken = ['tests'] if (checks.get('tests') or ('',))[0] == 'FAIL' else []
+    tests_passed = receipt['run'] is not None and (checks.get('tests') or ('',))[0] == 'PASS'
+    broken = [] if tests_passed else ['tests']
     if 'flows' in checks and checks['flows'][0] != 'PASS':
         broken.append('flows')
-    if receipt['run'] is None and 'tests' not in broken:
-        broken.append('tests')
     evidence = receipt['repro'] or {}
     tests = evidence.get('tests') or []
-    fails_then_passes = (any(test.get('base_exit') == 1 and test.get('head_exit') == 0 for test in tests)
-                         and not any(test.get('kind') == 'regression' for test in tests))
+    bash_unavailable = fails_then_passes = False
+    for test in tests:
+        base, head = test.get('base_exit'), test.get('head_exit')
+        if test.get('name', '').endswith('.sh::bash'):
+            bash_unavailable |= base not in (0, 1) or head not in (0, 1)
+        else:
+            fails_then_passes |= (base, head) == (1, 0)
+    fails_then_passes = fails_then_passes and not any(test.get('kind') == 'regression' for test in tests)
     repro = (checks.get('repro') or ('INCOMPLETE',))[0]
-    if bug_fix and repro != 'PASS' and not (repro == 'INCOMPLETE' and (evidence.get('opt_out_reason') or fails_then_passes)):
+    incomplete_allowed = (repro == 'INCOMPLETE' and not bash_unavailable
+                          and (evidence.get('opt_out_reason') or fails_then_passes))
+    if bug_fix and repro != 'PASS' and not incomplete_allowed:
         broken.append('repro of a bug fix')
     if broken:
         if 'repro of a bug fix' in broken:
             print(BUG_FIX_HELP, flush=True)
         print(f"COLDVERIFY CI FAIL: {', '.join(broken)}", flush=True)
         return 1
-    print(f"COLDVERIFY CI PASS: the receipt says {receipt['result']}; CI fails only for failing tests, flows that fail or could not run, "
-          'or a bug fix without a working repro', flush=True)
+    print(f"COLDVERIFY CI PASS: the receipt says {receipt['result']}. CI requires a passing test suite, "
+          'passing declared flows, and repro evidence for bug fixes.', flush=True)
     return 0
 
 
@@ -813,10 +932,25 @@ def receipt_proofs(body, claim, base, head):
         data = json.loads(last[len(REPRO_BLOCK):-len(' -->')])
     except ValueError:
         return None
-    if not isinstance(data, dict) or (data.get('claim'), data.get('base'), data.get('head')) != (claim_digest(claim), base, head):
+    if not isinstance(data, dict) or (data.get('base'), data.get('head')) != (base, head):
         return None
+    if data.get('claim') != claim_digest(claim):
+        if 'criteria_claim' in data:
+            if data['criteria_claim'] != claim_digest(criteria_claim(claim)):
+                return None
+        elif not same_criteria_claim(body, data.get('claim'), claim):
+            return None
     tests = data.get('tests')
     return [test if proof_row(test) else None for test in tests] if isinstance(tests, list) else [None]
+
+
+def criteria_claim(claim):
+    return ''.join(line for line in claim.splitlines(keepends=True) if not BUILDER.fullmatch(line.rstrip('\r\n'))).strip()
+
+
+def same_criteria_claim(body, digest, claim):
+    return any(claim_digest(match[1]) == digest and criteria_claim(match[1]) == criteria_claim(claim)
+               for match in re.finditer(r'^### Claim\n\n(.*?)\n\n(?=### Acceptance criteria\n)', body, re.M | re.S))
 
 
 def proof_row(test):
@@ -834,16 +968,48 @@ def strict_receipt(root, number, claim, base, head):
     return (receipts[-1].get('html_url'), tests) if tests is not None else (None, None)
 
 
-def criteria_result(root, number, builders):
+def t3_builder(repository, number):
+    try:
+        state = Path.home() / '.t3/userdata/statev2.sqlite'
+        with closing(sqlite3.connect(state.as_uri() + '?mode=ro', uri=True, timeout=5)) as db:
+            rows = db.execute("""
+                SELECT DISTINCT json_extract(r.payload_json, '$.modelSelection.model')
+                FROM orchestration_v2_projection_threads t
+                JOIN json_each(t.payload_json, '$.pullRequests') link
+                LEFT JOIN orchestration_v2_projection_runs r ON r.thread_id = t.thread_id
+                WHERE json_extract(link.value, '$.host') = 'github.com'
+                  AND lower(json_extract(link.value, '$.repository')) = lower(?)
+                  AND json_extract(link.value, '$.number') = ?
+                """, (repository, number)).fetchall()
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        raise verify_criteria.Unverified('could not read T3 launch state') from None
+    if not rows or any(not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]*', model)
+                       for model, in rows):
+        raise verify_criteria.Unverified(f'no T3 builder model for {repository}#{number}')
+    models = builder_set(model for model, in rows)
+    if len(models) != 1:
+        raise verify_criteria.Unverified(f'conflicting T3 builder models for {repository}#{number}')
+    return models[0]
+
+
+def criteria_result(root, number):
     try:
         pull = github(root, f'pulls/{number}')
         head, base, body = pull['head']['sha'], pull['base']['sha'], pull.get('body') or ''
+        repository = pull['base']['repo']['full_name']
     except (GitHubError, KeyError, TypeError) as error:
         return None, ('INCOMPLETE', 'could not read the PR: ' + (str(error) if isinstance(error, GitHubError) else 'unexpected reply'))
-    result = {'pull_request': number, 'head': head, 'base': base, 'builder_source': 'coldverify --builder-model', 'receipt': None,
+    result = {'pull_request': number, 'head': head, 'base': base,
+              'builder_source': None, 'receipt': None,
               'acceptance_criteria': [], 'criteria_verifier': None}
     try:
-        result['receipt'], tests = strict_receipt(root, number, claim_from(body), base, head)
+        builder = t3_builder(repository, number)
+    except verify_criteria.Unverified as error:
+        return result, ('INCOMPLETE', f'builder identity unverified. {error}')
+    result['builder_source'] = 'T3 PR link'
+    claim = claim_from(body)
+    try:
+        result['receipt'], tests = strict_receipt(root, number, claim, base, head)
     except (GitHubError, KeyError, TypeError) as error:
         return result, ('INCOMPLETE', 'could not read the receipts: ' + (str(error) if isinstance(error, GitHubError) else 'unexpected reply'))
     if tests is None:
@@ -860,28 +1026,27 @@ def criteria_result(root, number, builders):
             except subprocess.CalledProcessError as error:
                 return result, ('INCOMPLETE', f'could not fetch {commit}: ' + verify_repro.excerpt(error.stderr.decode(errors='replace')))
     check, result['acceptance_criteria'], result['criteria_verifier'] = verify_criteria.check(
-        root, claim_from(body), {'base': base, 'head': head, 'tests': tests}, builders, proved, builders_from(body))
+        root, criteria_claim(claim), {'base': base, 'head': head, 'tests': tests}, [builder], proved)
     return result, check
 
 
 def criteria_markdown(result, check):
-    lines = [f'## {CRITERIA_CHECK} {check[0]}', '', check[1], '', INFORMATIONAL, '',
+    lines = [f'## {CRITERIA_CHECK} {check[0]}', '', markdown_field(check[1]), '', INFORMATIONAL, '',
+             f"Builder source: {result['builder_source'] or 'none'}", '',
              f"Head: `{result['head']}`", '', f"Receipt: {result['receipt'] or 'none'}", '']
     if result['acceptance_criteria']:
         lines += ['| criterion | covered by |', '| --- | --- |']
-        lines += [f"| {criterion['id']}: {criterion['text'].replace('|', '/')} | "
-                  f"{', '.join(f'`{test}`' for test in criterion['covered_by']) or '**no proof test**'} |"
-                  for criterion in result['acceptance_criteria']]
+        lines += criterion_rows(result['acceptance_criteria'])
     return '\n'.join(lines)
 
 
-def criteria_check(root, number, builders, publish=False):
+def criteria_check(root, number, publish=False):
     from verify_context import coldbox_guest
-    if publish and (os.environ.get('GITHUB_ACTIONS') == 'true' or coldbox_guest()):
-        print(f'COLDVERIFY CRITERIA INCOMPLETE: --publish-check is refused in CI; only the trusted host step publishes {CRITERIA_CHECK}',
-              flush=True)
+    if os.environ.get('GITHUB_ACTIONS') == 'true' or coldbox_guest():
+        mode = '--publish-check' if publish else '--criteria-check'
+        print(f'COLDVERIFY CRITERIA INCOMPLETE: {mode} is refused in CI; {CRITERIA_CHECK} runs on a trusted host', flush=True)
         return 2
-    result, check = criteria_result(Path(root), number, builders)
+    result, check = criteria_result(Path(root), number)
     if result:
         result.update(result=check[0], reason=check[1])
         print(json.dumps(result, indent=2), flush=True)

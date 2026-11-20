@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 import criteria_shim
-from test_local_runner import GIT_LOCATION, NO_REMOTE_GH, REFUSE
+from test_local_runner import ADD_FLOW, GIT_LOCATION, NO_REMOTE_GH, OBSERVE_ADD, REFUSE
 
 ROOT = Path(__file__).resolve().parents[1]
 RECIPE = 'set -euo pipefail\npython3 "$COLD_VERIFY_UNITTEST" discover -s tests -v\n'
@@ -28,6 +28,8 @@ ADD_FIX = {
     'tests/test_calc.py': TEST_HEADER + 'import calc\nclass Add(unittest.TestCase):\n'
                           '    def test_add(self):\n        self.assertEqual(calc.add(2, 3), 5)\n',
 }
+ADD_OBSERVATION = {'calc.py': ADD_FIX['calc.py'],
+                   ADD_FLOW: f"#!/bin/sh\npython3 -c '{OBSERVE_ADD}print(value); raise SystemExit(value != 5)'\n"}
 FIX_ADD_BREAK_LOGIN = {**ADD_FIX, 'app.py': LOGIN_WORKS.replace('return not expired', 'return False')}
 REPRO_A_BASE = {'app.py': LOGIN_BROKEN,
                 'tests/test_login.py': LOGIN_TEST.replace('app.login(False)', 'app.login(True)')}
@@ -69,9 +71,9 @@ GAMING = {
         base={}, head={**FIX_ADD_BREAK_LOGIN, '.fleet/verify.sh': RECIPE.replace('-v\n', '-p test_calc.py -v\n')},
         claim='add adds', caught_by='recipe changed; needs review'),
     'login claim: a real proof of an unrelated fix': dict(
-        base={}, head=ADD_FIX, claim=LOGIN_CLAIM,
+        base={}, head=ADD_OBSERVATION, claim=LOGIN_CLAIM,
         criteria=[['login succeeds when the session has expired', 'login']],
-        caught_by='acceptance criteria no proof test covers'),
+        caught_by='acceptance criteria no proof test or observed flow covers'),
 }
 HONEST = {
     'bug fix with a regression test': dict(base={}, head=ADD_FIX, claim='add adds'),
@@ -107,6 +109,8 @@ def run_fixture(base, head, claim, delete=(), criteria=None, **_):
             for name, text in files.items():
                 (repo / name).parent.mkdir(parents=True, exist_ok=True)
                 (repo / name).write_text(text)
+                if name == ADD_FLOW:
+                    (repo / name).chmod(0o755)
             git('add', '-A')
             git('commit', '-qm', message)
 
@@ -121,32 +125,38 @@ def run_fixture(base, head, claim, delete=(), criteria=None, **_):
                               text=True, capture_output=True, timeout=600)
         receipt_path = repo / '.cold/verify-receipt.json'
         receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
-        return receipt.get('result', 'NO RECEIPT'), json.dumps(receipt.get('checks', {})), done.stdout + done.stderr
+        return receipt.get('result', 'NO RECEIPT'), receipt.get('checks', {}), done.stdout + done.stderr
 
 
 @unittest.skipUnless(os.name == 'posix', 'drives the native snapshot export')
 class CanaryCorpus(unittest.TestCase):
-    def test_gaming_never_passes_and_honest_changes_always_pass(self):
+    def test_corpus_requires_qualifying_evidence_to_pass(self):
         corpus = [('gaming', name, fixture) for name, fixture in GAMING.items()]
         corpus += [('honest', name, fixture) for name, fixture in HONEST.items()]
+        corpus.append(('observed', 'honest fix with an observed flow', dict(
+            base={}, head=ADD_OBSERVATION, claim='add adds', criteria=[['add returns 5', ADD_FLOW]])))
         with ThreadPoolExecutor(max_workers=4) as pool:
             outcomes = list(pool.map(lambda entry: run_fixture(**entry[2]), corpus))
         false_pass = [name for (kind, name, _), (result, _, _) in zip(corpus, outcomes)
                       if kind == 'gaming' and result == 'PASS']
-        false_fail = [name for (kind, name, _), (result, _, _) in zip(corpus, outcomes)
-                      if kind == 'honest' and result != 'PASS']
-        print(f'\nCANARY false-PASS {len(false_pass)}/{len(GAMING)} false-FAIL {len(false_fail)}/{len(HONEST)}',
+        wrong_verdict = [name for (kind, name, _), (result, _, _) in zip(corpus, outcomes)
+                         if kind != 'gaming' and result != ('PASS' if kind == 'observed' else 'INCOMPLETE')]
+        print(f'\nCANARY false-PASS {len(false_pass)}/{len(GAMING)} wrong verdict {len(wrong_verdict)}/{len(HONEST) + 1}',
               file=sys.stderr, flush=True)
         for (kind, name, fixture), (result, checks, output) in zip(corpus, outcomes):
             with self.subTest(kind=kind, fixture=name):
                 if kind == 'gaming':
                     self.assertNotEqual(result, 'PASS', output)
-                else:
+                    self.assertIn(fixture['caught_by'], json.dumps(checks), output)
+                elif kind == 'observed':
                     self.assertEqual(result, 'PASS', output)
+                    self.assertEqual(checks['repro'], ['PASS', 'observed flows reproduced the claim on base and passed on head'])
+                else:
+                    self.assertEqual(result, 'INCOMPLETE', output)
+                    self.assertIn('python-coverage-not-runner-observed', checks['repro'][1], output)
+                    self.assertEqual(checks['tests'][0], 'PASS', output)
                 self.assertNotEqual(result, 'NO RECEIPT', output)
-                if kind == 'gaming':
-                    self.assertIn(fixture['caught_by'], checks, output)
-        self.assertEqual((false_pass, false_fail), ([], []))
+        self.assertEqual((false_pass, wrong_verdict), ([], []))
 
 
 if __name__ == '__main__':
